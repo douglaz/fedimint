@@ -179,14 +179,14 @@ impl ConsensusServer {
         cfg.validate_config(&cfg.local.identity, &module_inits)?;
 
         // Build P2P connections for HBBFT consensus
-        let connections = ReconnectPeerConnections::new(
+        let (connections, peer_status_senders) = ReconnectPeerConnections::new(
             cfg.network_config(),
             delay_calculator,
             connector,
             task_group,
         )
-        .await
-        .into_dyn();
+        .await;
+        let connections = connections.into_dyn();
 
         let net_info = NetworkInfo::new(
             cfg.local.identity,
