@@ -43,7 +43,7 @@ use crate::module::ApiRequestErased;
 use crate::outcome::TransactionStatus;
 use crate::query::{
     CurrentConsensus, EventuallyConsistent, QueryStep, QueryStrategy, UnionResponses,
-    VerifiableResponse,
+    UnionResponsesSingle, VerifiableResponse,
 };
 use crate::transaction::{SerdeTransaction, Transaction};
 
@@ -268,6 +268,22 @@ pub trait FederationApiExt: IFederationApi {
         .await
     }
 
+    async fn request_total_union_single<Ret>(
+        &self,
+        method: String,
+        params: ApiRequestErased,
+    ) -> FederationResult<Vec<Ret>>
+    where
+        Ret: serde::de::DeserializeOwned + Eq + Debug + Clone + MaybeSend,
+    {
+        self.request_with_strategy(
+            UnionResponsesSingle::new(self.all_members().total()),
+            method,
+            params,
+        )
+        .await
+    }
+
     async fn request_current_consensus<Ret>(
         &self,
         method: String,
@@ -331,6 +347,8 @@ pub trait GlobalFederationApi {
     ) -> FederationResult<SignedEpochOutcome>;
 
     async fn fetch_epoch_count(&self) -> FederationResult<u64>;
+
+    async fn fetch_epoch_count_overview(&self) -> FederationResult<Vec<u64>>;
 
     async fn fetch_output_outcome<R>(
         &self,
@@ -480,6 +498,11 @@ where
             ApiRequestErased::default(),
         )
         .await
+    }
+
+    async fn fetch_epoch_count_overview(&self) -> FederationResult<Vec<u64>> {
+        self.request_total_union_single("fetch_epoch_count".to_owned(), ApiRequestErased::default())
+            .await
     }
 
     async fn fetch_output_outcome<R>(

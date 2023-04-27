@@ -153,6 +153,10 @@ enum CliOutput {
         count: u64,
     },
 
+    EpochCountOverview {
+        counts: Vec<u64>,
+    },
+
     LastEpoch {
         hex_outcome: String,
     },
@@ -550,6 +554,9 @@ enum Command {
 
     /// Gets the current epoch count
     EpochCount,
+
+    /// Gets the epoch count as reported by other peers
+    EpochCountOverview,
 
     /// Gets the last epoch
     LastEpoch,
@@ -1026,6 +1033,16 @@ impl FedimintCli {
                     .fetch_epoch_count()
                     .await?;
                 Ok(CliOutput::EpochCount { count })
+            }
+            Command::EpochCountOverview => {
+                let counts = cli
+                    .build_client(&self.module_gens)
+                    .await?
+                    .context()
+                    .api
+                    .fetch_epoch_count_overview()
+                    .await?;
+                Ok(CliOutput::EpochCountOverview { counts })
             }
             Command::LastEpoch => {
                 let cfg = cli.load_config()?;
