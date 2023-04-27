@@ -268,7 +268,7 @@ pub trait FederationApiExt: IFederationApi {
         .await
     }
 
-    async fn request_total_union_single<Ret>(
+    async fn request_full_answer<Ret>(
         &self,
         method: String,
         params: ApiRequestErased,
@@ -322,6 +322,12 @@ impl<T: ?Sized> FederationApiExt for T where T: IFederationApi {}
 
 dyn_newtype_define! {
     pub DynFederationApi(Arc<IFederationApi>)
+}
+
+impl Clone for DynFederationApi {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
 }
 
 impl AsRef<dyn IFederationApi + 'static> for DynFederationApi {
@@ -501,7 +507,7 @@ where
     }
 
     async fn fetch_epoch_count_overview(&self) -> FederationResult<Vec<u64>> {
-        self.request_total_union_single("fetch_epoch_count".to_owned(), ApiRequestErased::default())
+        self.request_full_answer("fetch_epoch_count".to_owned(), ApiRequestErased::default())
             .await
     }
 

@@ -216,6 +216,12 @@ pub enum ServerStatus {
     ConsensusRunning,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FullStatus {
+    pub peers_desynced: u64,
+    pub status: ServerStatus,
+}
+
 /// Sent by admin user to the API
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigGenConnectionsRequest {

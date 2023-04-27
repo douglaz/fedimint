@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bitcoin_hashes::sha256;
-use fedimint_core::admin_client::ServerStatus;
-use fedimint_core::api::WsClientConnectInfo;
+use fedimint_core::admin_client::{FullStatus, ServerStatus};
+use fedimint_core::api::{DynFederationApi, GlobalFederationApi, WsClientConnectInfo};
 use fedimint_core::config::ClientConfigResponse;
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::db::{Database, DatabaseTransaction, ModuleDatabaseTransaction};
@@ -71,6 +71,7 @@ pub struct ConsensusApi {
     pub api_sender: Sender<ApiEvent>,
 
     pub supported_api_versions: SupportedApiVersionsSummary,
+    pub federation_api: DynFederationApi,
 }
 
 impl ConsensusApi {
@@ -431,6 +432,19 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<ConsensusApi>> {
                 } else {
                     Err(ApiError::unauthorized())
                 }
+            }
+        },
+        api_endpoint! {
+            "full_status",
+            async |fedimint: &ConsensusApi, _context, _v: ()| -> FullStatus {
+                let epoch = fedimint.get_epoch_count().await;
+                let overview = fedimint.federation_api.fetch_epoch_count_overview().await
+                    .map_err(|e| ApiError::server_error(format!("Unable to fetch epoch count overview: {e}")))?;
+                let behind_peers = overview.into_iter().filter(|e| *e < epoch).count() as u64;
+                Ok(FullStatus {
+                    peers_desynced: behind_peers, // TODO: add offline peers
+                    status: ServerStatus::ConsensusRunning
+                })
             }
         },
         api_endpoint! {

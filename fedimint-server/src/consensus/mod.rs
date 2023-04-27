@@ -7,6 +7,7 @@ pub mod server;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::iter::FromIterator;
 
+use fedimint_core::api::DynFederationApi;
 use fedimint_core::config::ServerModuleGenRegistry;
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::db::{Database, DatabaseTransaction};

@@ -204,7 +204,7 @@ impl ConsensusServer {
             .clone()
             .into_iter()
             .map(|(id, node)| (id, node.url));
-        let api = WsFederationApi::new(api_endpoints.collect());
+        let api: DynFederationApi = WsFederationApi::new(api_endpoints.collect()).into();
         let mut other_peers: BTreeSet<_> = cfg.local.p2p_endpoints.keys().cloned().collect();
         other_peers.remove(&cfg.local.identity);
 
@@ -220,6 +220,7 @@ impl ConsensusServer {
             client_cfg,
             api_sender,
             supported_api_versions: ServerConfig::supported_api_versions_summary(&modules),
+            federation_api: api.clone(),
         };
 
         // Build consensus processor
@@ -239,7 +240,7 @@ impl ConsensusServer {
             consensus,
             api_receiver: ReceiverStream::new(api_receiver).peekable(),
             cfg: cfg.clone(),
-            api: api.into(),
+            api,
             other_peers,
             rejoin_at_epoch: Default::default(),
             run_empty_epochs: 0,
