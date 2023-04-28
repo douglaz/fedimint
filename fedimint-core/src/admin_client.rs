@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Debug;
 
 use bitcoin_hashes::sha256;
@@ -214,6 +214,14 @@ pub enum ServerStatus {
     Upgrading,
     /// Consensus is running
     ConsensusRunning,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FullStatus {
+    pub our_epoch: u64,
+    pub epoch_per_peer: HashMap<PeerId, u64>,
+    pub peers_desynced: u64,
+    pub status: ServerStatus,
 }
 
 /// Sent by admin user to the API

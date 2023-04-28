@@ -1,10 +1,11 @@
 //! Implements the client API through which users interact with the federation
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bitcoin_hashes::sha256;
-use fedimint_core::admin_client::ServerStatus;
+use fedimint_core::admin_client::{FullStatus, ServerStatus};
 use fedimint_core::api::WsClientConnectInfo;
 use fedimint_core::config::ClientConfigResponse;
 use fedimint_core::core::ModuleInstanceId;
@@ -18,7 +19,7 @@ use fedimint_core::module::{
 use fedimint_core::outcome::TransactionStatus;
 use fedimint_core::server::DynServerModule;
 use fedimint_core::transaction::Transaction;
-use fedimint_core::{OutPoint, TransactionId};
+use fedimint_core::{OutPoint, PeerId, TransactionId};
 use jsonrpsee::RpcModule;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::Sender;
@@ -27,6 +28,7 @@ use tracing::debug;
 use crate::config::api::ApiResult;
 use crate::config::ServerConfig;
 use crate::consensus::interconnect::FedimintInterconnect;
+use crate::consensus::server::RejoinAtEpoch;
 use crate::consensus::{
     AcceptedTransaction, ApiEvent, FundingVerifier, TransactionSubmissionError,
 };
@@ -69,6 +71,7 @@ pub struct ConsensusApi {
     pub client_cfg: ClientConfigResponse,
     /// For sending API events to consensus such as transactions
     pub api_sender: Sender<ApiEvent>,
+    pub rejoin_at_epoch: RejoinAtEpoch,
 
     pub supported_api_versions: SupportedApiVersionsSummary,
 }
@@ -296,6 +299,42 @@ impl ConsensusApi {
             .await
             .map_err(|_| ApiError::server_error("Unable send event".to_string()))
     }
+
+    async fn build_full_server_status(&self) -> ApiResult<FullStatus> {
+        let epoch = self.get_epoch_count().await;
+        // Clone to avoid holding the lock while we calculate things
+        let rejoin_at_epoch = self.rejoin_at_epoch.lock().await.clone();
+        let latest_epoch_per_peer = rejoin_at_epoch.into_iter().fold(
+            HashMap::<PeerId, u64>::new(),
+            |mut acc, (epoch, peers)| {
+                let epoch = epoch + 1;
+                for peer in peers {
+                    match acc.entry(peer) {
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            // Only update if the epoch is higher
+                            if epoch > *entry.get() {
+                                entry.insert(epoch);
+                            }
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(epoch);
+                        }
+                    }
+                }
+                acc
+            },
+        );
+        let behind_peers = latest_epoch_per_peer
+            .iter()
+            .filter(|(_, peer_epoch)| **peer_epoch < epoch)
+            .count() as u64;
+        Ok(FullStatus {
+            our_epoch: epoch,
+            peers_desynced: behind_peers,
+            status: ServerStatus::ConsensusRunning,
+            epoch_per_peer: latest_epoch_per_peer,
+        })
+    }
 }
 
 #[async_trait]
@@ -431,6 +470,12 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<ConsensusApi>> {
                 } else {
                     Err(ApiError::unauthorized())
                 }
+            }
+        },
+        api_endpoint! {
+            "full_status",
+            async |fedimint: &ConsensusApi, _context, _v: ()| -> FullStatus {
+                Ok(fedimint.build_full_server_status().await?)
             }
         },
         api_endpoint! {

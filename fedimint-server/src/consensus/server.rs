@@ -25,7 +25,7 @@ use jsonrpsee::core::Serialize;
 use rand::rngs::OsRng;
 use rand::{CryptoRng, RngCore};
 use serde::Deserialize;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, warn};
 
@@ -69,6 +69,7 @@ enum EpochTriggerEvent {
     RunEpochRequest,
 }
 
+pub(crate) type RejoinAtEpoch = Arc<Mutex<HashMap<u64, HashSet<PeerId>>>>;
 /// Runs the main server consensus loop
 pub struct ConsensusServer {
     /// `TaskGroup` that is running the server
@@ -88,7 +89,7 @@ pub struct ConsensusServer {
     /// The list of all other peers
     pub other_peers: BTreeSet<PeerId>,
     /// If `Some` then we restarted and look for the epoch to rejoin at
-    pub rejoin_at_epoch: HashMap<u64, HashSet<PeerId>>,
+    pub rejoin_at_epoch: RejoinAtEpoch,
     /// How many empty epochs peers requested we run
     pub run_empty_epochs: u64,
     /// Tracks the last epoch outcome from consensus
@@ -213,6 +214,7 @@ impl ConsensusServer {
         let client_cfg = cfg.consensus.to_config_response(&module_inits);
         let modules = ModuleRegistry::from(modules);
 
+        let rejoin_at_epoch: RejoinAtEpoch = Default::default();
         let consensus_api = ConsensusApi {
             cfg: cfg.clone(),
             db: db.clone(),
@@ -220,6 +222,7 @@ impl ConsensusServer {
             client_cfg,
             api_sender,
             supported_api_versions: ServerConfig::supported_api_versions_summary(&modules),
+            rejoin_at_epoch: Arc::clone(&rejoin_at_epoch),
         };
 
         // Build consensus processor
@@ -241,7 +244,7 @@ impl ConsensusServer {
             cfg: cfg.clone(),
             api: api.into(),
             other_peers,
-            rejoin_at_epoch: Default::default(),
+            rejoin_at_epoch,
             run_empty_epochs: 0,
             last_processed_epoch: None,
             decoders: modules.decoder_registry(),
@@ -303,7 +306,7 @@ impl ConsensusServer {
             "Starting consensus at epoch {}", epoch
         );
         self.hbbft.skip_to_epoch(epoch);
-        self.rejoin_at_epoch = HashMap::new();
+        self.rejoin_at_epoch.lock().await.clear();
         self.request_rejoin(1).await;
     }
 
@@ -328,7 +331,10 @@ impl ConsensusServer {
         // for checking the hashes of the epoch history
         let mut prev_epoch: Option<SignedEpochOutcome> = self.last_processed_epoch.clone();
         // we can remove tracking past epochs
-        self.rejoin_at_epoch.retain(|k, _| k > &last_outcome.epoch);
+        self.rejoin_at_epoch
+            .lock()
+            .await
+            .retain(|k, _| k > &last_outcome.epoch);
         // ensure HBBFT is at the next epoch after we process this one
         self.hbbft.skip_to_epoch(last_outcome.epoch + 1);
 
@@ -568,11 +574,15 @@ impl ConsensusServer {
     /// `NUM_EPOCHS_REJOIN_AHEAD` so we can ensure we receive enough HBBFT
     /// messages to produce an outcome.
     async fn rejoin_at_epoch(&mut self, epoch: u64, peer: PeerId) {
-        let peers = self.rejoin_at_epoch.entry(epoch).or_default();
-        peers.insert(peer);
+        let peers_len = {
+            let mut rejoin_at_epoch = self.rejoin_at_epoch.lock().await;
+            let peers = rejoin_at_epoch.entry(epoch).or_default();
+            peers.insert(peer);
+            peers.len()
+        };
         let threshold = self.cfg.local.p2p_endpoints.threshold();
 
-        if peers.len() >= threshold && self.hbbft.epoch() < epoch {
+        if peers_len >= threshold && self.hbbft.epoch() < epoch {
             info!(
                 target: LOG_CONSENSUS,
                 "Skipping to epoch {}",
