@@ -39,7 +39,10 @@ where
 {
     async fn fetch_contract(&self, contract: ContractId) -> FederationResult<ContractAccount> {
         self.with_module(LEGACY_HARDCODED_INSTANCE_ID_LN)
-            .request_current_consensus("wait_account".to_string(), ApiRequestErased::new(contract))
+            .request_current_consensus(
+                "wait_account".to_string(),
+                ApiRequestErased::new(&[contract]),
+            )
             .await
     }
     async fn fetch_offer(
@@ -49,7 +52,7 @@ where
         self.with_module(LEGACY_HARDCODED_INSTANCE_ID_LN)
             .request_current_consensus(
                 "wait_offer".to_string(),
-                ApiRequestErased::new(payment_hash),
+                ApiRequestErased::new(&[payment_hash]),
             )
             .await
     }
@@ -69,7 +72,7 @@ where
             .request_with_strategy(
                 CurrentConsensus::new(self.all_members().threshold()),
                 "register_gateway".to_string(),
-                ApiRequestErased::new(gateway),
+                ApiRequestErased::new(&[gateway]),
             )
             .await
     }
@@ -79,7 +82,7 @@ where
             .with_module(LEGACY_HARDCODED_INSTANCE_ID_LN)
             .request_current_consensus::<Option<IncomingContractOffer>>(
                 "offer".to_string(),
-                ApiRequestErased::new(payment_hash),
+                ApiRequestErased::new(&[payment_hash]),
             )
             .await?
             .is_some())
@@ -111,7 +114,7 @@ where
             .request_with_strategy(
                 CurrentConsensus::new(self.all_members().threshold()),
                 "backup".to_string(),
-                ApiRequestErased::new(request),
+                ApiRequestErased::new(&[request]),
             )
             .await
     }
@@ -126,7 +129,7 @@ where
                     self.all_members().threshold(),
                 ),
                 "recover".to_string(),
-                ApiRequestErased::new(id),
+                ApiRequestErased::new(&[id]),
             )
             .await?
             .into_iter()
@@ -168,7 +171,7 @@ where
         self.with_module(LEGACY_HARDCODED_INSTANCE_ID_WALLET)
             .request_eventually_consistent(
                 "peg_out_fees".to_string(),
-                ApiRequestErased::new((address, amount.to_sat())),
+                ApiRequestErased::new_pair((address, amount.to_sat())),
             )
             .await
     }

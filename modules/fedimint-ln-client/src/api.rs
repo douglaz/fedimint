@@ -39,8 +39,11 @@ where
     T: IFederationApi + MaybeSend + MaybeSync + 'static,
 {
     async fn fetch_contract(&self, contract: ContractId) -> FederationResult<ContractAccount> {
-        self.request_current_consensus("wait_account".to_string(), ApiRequestErased::new(contract))
-            .await
+        self.request_current_consensus(
+            "wait_account".to_string(),
+            ApiRequestErased::new(&[contract]),
+        )
+        .await
     }
     async fn fetch_offer(
         &self,
@@ -48,7 +51,7 @@ where
     ) -> FederationResult<IncomingContractOffer> {
         self.request_current_consensus(
             "wait_offer".to_string(),
-            ApiRequestErased::new(payment_hash),
+            ApiRequestErased::new(&[payment_hash]),
         )
         .await
     }
@@ -66,7 +69,7 @@ where
         self.request_with_strategy(
             CurrentConsensus::new(self.all_members().threshold()),
             "register_gateway".to_string(),
-            ApiRequestErased::new(gateway),
+            ApiRequestErased::new(&[gateway]),
         )
         .await
     }
@@ -75,7 +78,7 @@ where
         Ok(self
             .request_current_consensus::<Option<IncomingContractOffer>>(
                 "offer".to_string(),
-                ApiRequestErased::new(payment_hash),
+                ApiRequestErased::new(&[payment_hash]),
             )
             .await?
             .is_some())

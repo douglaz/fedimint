@@ -48,7 +48,7 @@ impl WsAdminClient {
         &self,
         info: ConfigGenConnectionsRequest,
     ) -> FederationResult<()> {
-        self.request_auth("set_config_gen_connections", ApiRequestErased::new(info))
+        self.request_auth("set_config_gen_connections", ApiRequestErased::new(&[info]))
             .await
     }
 
@@ -60,7 +60,7 @@ impl WsAdminClient {
     ///
     /// This call is not authenticated because it's guardian-to-guardian
     pub async fn add_config_gen_peer(&self, peer: PeerServerParams) -> FederationResult<()> {
-        self.request("add_config_gen_peer", ApiRequestErased::new(peer))
+        self.request("add_config_gen_peer", ApiRequestErased::new(&[peer]))
             .await
     }
 
@@ -83,7 +83,7 @@ impl WsAdminClient {
     /// Sends a signal to consensus that we want to force running an epoch
     /// outcome
     pub async fn force_process_epoch(&self, outcome: SerdeEpochHistory) -> FederationResult<()> {
-        self.request_auth("process_outcome", ApiRequestErased::new(outcome))
+        self.request_auth("process_outcome", ApiRequestErased::new(&[outcome]))
             .await
     }
 
@@ -112,7 +112,7 @@ impl WsAdminClient {
         &self,
         requested: ConfigGenParamsRequest,
     ) -> FederationResult<()> {
-        self.request_auth("set_config_gen_params", ApiRequestErased::new(requested))
+        self.request_auth("set_config_gen_params", ApiRequestErased::new(&[requested]))
             .await
     }
 

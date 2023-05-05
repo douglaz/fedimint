@@ -277,7 +277,9 @@ mod tests {
                     let api_req: ApiRequestErased =
                         serde_json::from_value(params[0].clone()).unwrap();
                     let serde_tx: SerdeTransaction =
-                        serde_json::from_value(api_req.params).unwrap();
+                        serde_json::from_value(Value::Array(api_req.params)).unwrap();
+                    // let serde_tx: SerdeTransaction =
+                    //     serde_json::from_value(params[0].clone()).unwrap();
                     let tx = serde_tx.try_into_inner(&Default::default()).unwrap();
 
                     self.txns.lock().await.push(tx.tx_hash());
@@ -285,9 +287,13 @@ mod tests {
                     Ok(serde_json::to_value(tx.tx_hash()).unwrap())
                 }
                 "wait_transaction" => {
+                    println!("params: {params:?}");
                     let api_req: ApiRequestErased =
                         serde_json::from_value(params[0].clone()).unwrap();
-                    let txid: TransactionId = serde_json::from_value(api_req.params).unwrap();
+                    let txid: TransactionId =
+                        serde_json::from_value(Value::Array(api_req.params)).unwrap();
+
+                    // let txid: TransactionId = serde_json::from_value(params[0].clone()).unwrap();
 
                     loop {
                         let api_lock = self.txns.lock().await;

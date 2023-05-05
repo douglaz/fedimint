@@ -26,6 +26,7 @@ use fedimint_logging::LOG_NET_API;
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
 use jsonrpsee_core::client::ClientT;
+use jsonrpsee_core::traits::ToRpcParams;
 use jsonrpsee_core::Error as JsonRpcError;
 #[cfg(target_family = "wasm")]
 use jsonrpsee_wasm_client::{Client as WsClient, WasmClientBuilder as WsClientBuilder};
@@ -52,6 +53,14 @@ pub type MemberResult<T> = result::Result<T, MemberError>;
 
 pub type JsonRpcResult<T> = result::Result<T, jsonrpsee_core::Error>;
 pub type FederationResult<T> = result::Result<T, FederationError>;
+
+pub struct EmptyParams;
+
+impl ToRpcParams for EmptyParams {
+    fn to_rpc_params(self) -> Result<Option<Box<jsonrpsee_core::JsonRawValue>>, JsonRpcError> {
+        Ok(None)
+    }
+}
 
 /// An API request error when calling a single federation member
 #[derive(Debug, Error)]
@@ -406,7 +415,7 @@ where
     async fn submit_transaction(&self, tx: Transaction) -> FederationResult<TransactionId> {
         self.request_current_consensus(
             "transaction".to_owned(),
-            ApiRequestErased::new(&SerdeTransaction::from(&tx)),
+            ApiRequestErased::new(&[SerdeTransaction::from(&tx)]),
         )
         .await
     }
@@ -472,7 +481,7 @@ where
         self.request_with_strategy::<SerdeEpochHistory, _>(
             qs,
             "fetch_epoch_history".to_owned(),
-            ApiRequestErased::new(epoch),
+            ApiRequestErased::new(&[epoch]),
         )
         .await
     }
@@ -537,9 +546,13 @@ where
             },
         );
 
-        self.request_with_strategy(qs, "config".to_owned(), ApiRequestErased::new(info.clone()))
-            .await
-            .map(|cfg: ClientConfigResponse| cfg.client_config)
+        self.request_with_strategy(
+            qs,
+            "config".to_owned(),
+            ApiRequestErased::new(&[info.clone()]),
+        )
+        .await
+        .map(|cfg: ClientConfigResponse| cfg.client_config)
     }
 
     async fn consensus_config_hash(&self) -> FederationResult<sha256::Hash> {
@@ -793,7 +806,11 @@ pub struct PeerResponse<R> {
 
 impl<C: JsonRpcClient> FederationMember<C> {
     #[instrument(level = "trace", fields(peer = %self.peer_id, %method), skip_all)]
-    pub async fn request(&self, method: &str, params: &[Value]) -> JsonRpcResult<Value> {
+    pub async fn request<Params: ToRpcParams + Send>(
+        &self,
+        method: &str,
+        params: Params,
+    ) -> JsonRpcResult<Value> {
         let rclient = self.client.read().await;
         match &*rclient {
             Some(client) if client.is_connected() => {
@@ -1017,14 +1034,14 @@ mod tests {
             "should not connect before first request"
         );
 
-        fed.request("", &[]).await.unwrap();
+        fed.request("", EmptyParams).await.unwrap();
         assert_eq!(
             CONNECTION_COUNT.load(Ordering::SeqCst),
             1,
             "should connect once after first request"
         );
 
-        fed.request("", &[]).await.unwrap();
+        fed.request("", EmptyParams).await.unwrap();
         assert_eq!(
             CONNECTION_COUNT.load(Ordering::SeqCst),
             1,
@@ -1034,7 +1051,7 @@ mod tests {
         // disconnect
         CONNECTED.store(false, Ordering::SeqCst);
 
-        fed.request("", &[]).await.unwrap();
+        fed.request("", EmptyParams).await.unwrap();
         assert_eq!(
             CONNECTION_COUNT.load(Ordering::SeqCst),
             2,
@@ -1085,12 +1102,12 @@ mod tests {
         FAIL.lock().unwrap().insert(0);
 
         assert!(
-            fed.request("", &[]).await.is_err(),
+            fed.request("", EmptyParams).await.is_err(),
             "connect for client 0 should fail"
         );
 
         // connect for client 1 should succeed
-        fed.request("", &[]).await.unwrap();
+        fed.request("", EmptyParams).await.unwrap();
 
         assert_eq!(
             CONNECTION_COUNT.load(Ordering::SeqCst),
@@ -1102,7 +1119,7 @@ mod tests {
         FAIL.lock().unwrap().insert(1);
 
         // only connect once even for two concurrent requests
-        let (reqa, reqb) = tokio::join!(fed.request("", &[]), fed.request("", &[]));
+        let (reqa, reqb) = tokio::join!(fed.request("", EmptyParams), fed.request("", EmptyParams));
         reqa.expect("both request should be successful");
         reqb.expect("both request should be successful");
 
@@ -1120,7 +1137,7 @@ mod tests {
         FAIL.lock().unwrap().insert(3);
 
         // only connect once even for two concurrent requests
-        let (reqa, reqb) = tokio::join!(fed.request("", &[]), fed.request("", &[]));
+        let (reqa, reqb) = tokio::join!(fed.request("", EmptyParams), fed.request("", EmptyParams));
 
         assert_eq!(
             CONNECTION_COUNT.load(Ordering::SeqCst),

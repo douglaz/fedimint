@@ -37,7 +37,7 @@ use fedimint_core::db::{Database, DatabaseValue};
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::epoch::{SerdeEpochHistory, SignedEpochOutcome};
 use fedimint_core::module::registry::ModuleDecoderRegistry;
-use fedimint_core::module::{ApiAuth, ApiRequestErased};
+use fedimint_core::module::{ApiAuth, ApiRequest, ApiRequestErased};
 use fedimint_core::query::EventuallyConsistent;
 use fedimint_core::task::TaskGroup;
 use fedimint_core::txoproof::TxOutProof;
@@ -682,23 +682,27 @@ impl FedimintCli {
                 params,
                 peer_id,
             } => {
-                let params: Value = serde_json::from_str(&params)
-                    .map_err_cli_msg(CliErrorKind::InvalidValue, "Invalid JSON-RPC parameters")?;
-                let params = ApiRequestErased::new(params);
+                let params = match serde_json::from_str::<Value>(&params)
+                    .map_err_cli_msg(CliErrorKind::InvalidValue, "Invalid JSON-RPC parameters")?
+                {
+                    Value::Null => vec![],
+                    Value::Array(values) => values,
+                    other => vec![other],
+                };
                 let ws_api: Arc<_> = WsFederationApi::from_config(
                     cli.build_client(&self.module_gens).await?.config().as_ref(),
                 )
                 .into();
                 let response: Value = match peer_id {
                     Some(peer_id) => ws_api
-                        .request_raw(peer_id.into(), &method, &[params.to_json()])
+                        .request_raw(peer_id.into(), &method, &params)
                         .await
                         .map_err_cli_general()?,
                     None => ws_api
                         .request_with_strategy(
                             EventuallyConsistent::new(ws_api.peers().len()),
                             method,
-                            params,
+                            ApiRequestErased::new(&params),
                         )
                         .await
                         .map_err_cli_general()?,

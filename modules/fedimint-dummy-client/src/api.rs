@@ -17,12 +17,15 @@ where
     T: IFederationApi + MaybeSend + MaybeSync + 'static,
 {
     async fn sign_message(&self, message: String) -> FederationResult<()> {
-        self.request_current_consensus("sign_message".to_string(), ApiRequestErased::new(message))
-            .await
+        self.request_current_consensus(
+            "sign_message".to_string(),
+            ApiRequestErased::new(&[message]),
+        )
+        .await
     }
 
     async fn wait_signed(&self, message: String) -> FederationResult<SerdeSignature> {
-        self.request_current_consensus("wait_signed".to_string(), ApiRequestErased::new(message))
+        self.request_current_consensus("wait_signed".to_string(), ApiRequestErased::new(&[message]))
             .await
     }
 }

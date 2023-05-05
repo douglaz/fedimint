@@ -37,7 +37,7 @@ where
     ) -> FederationResult<Option<PegOutFees>> {
         self.request_eventually_consistent(
             "peg_out_fees".to_string(),
-            ApiRequestErased::new((address, amount.to_sat())),
+            ApiRequestErased::new_pair((address, amount.to_sat())),
         )
         .await
     }

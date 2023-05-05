@@ -70,23 +70,39 @@ pub struct ApiRequest<T> {
     pub params: T,
 }
 
-pub type ApiRequestErased = ApiRequest<JsonValue>;
+pub type ApiRequestErased = ApiRequest<Vec<JsonValue>>;
 
 impl Default for ApiRequestErased {
     fn default() -> Self {
         Self {
             auth: None,
-            params: JsonValue::Null,
+            params: vec![],
         }
     }
 }
 
 impl ApiRequestErased {
-    pub fn new<T: Serialize>(params: T) -> ApiRequestErased {
+    pub fn new<T: Serialize>(params: &[T]) -> ApiRequestErased {
         Self {
             auth: None,
-            params: serde_json::to_value(params)
-                .expect("parameter serialization error - this should not happen"),
+            params: params
+                .into_iter()
+                .map(|p| {
+                    serde_json::to_value(p)
+                        .expect("parameter serialization error - this should not happen")
+                })
+                .collect(),
+        }
+    }
+    pub fn new_pair<A: Serialize, B: Serialize>(params: (A, B)) -> ApiRequestErased {
+        Self {
+            auth: None,
+            params: vec![
+                serde_json::to_value(params.0)
+                    .expect("parameter serialization error - this should not happen"),
+                serde_json::to_value(params.1)
+                    .expect("parameter serialization error - this should not happen"),
+            ],
         }
     }
 
@@ -106,7 +122,7 @@ impl ApiRequestErased {
     ) -> Result<ApiRequest<T>, serde_json::Error> {
         Ok(ApiRequest {
             auth: self.auth,
-            params: serde_json::from_value::<T>(self.params)?,
+            params: serde_json::from_value::<T>(JsonValue::Array(self.params))?,
         })
     }
 }
