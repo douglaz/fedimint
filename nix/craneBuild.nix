@@ -279,5 +279,12 @@ craneLib.overrideScope' (self: prev: {
       devimint = { };
     };
   };
+
+  fedimint-load-test-tool = self.pkgsBuild {
+    name = "fedimint-load-test-tool";
+    pkgs = {
+      fedimint-load-test-tool = { };
+    };
+  };
 })
 

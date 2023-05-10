@@ -157,6 +157,7 @@
             client-pkgs = craneLibNative.client-pkgs { };
             fedimint-dbtool-pkgs = craneLibNative.fedimint-dbtool-pkgs;
             devimint = craneLibNative.devimint;
+            fedimint-load-test-tool = craneLibNative.fedimint-load-test-tool;
           };
 
           # rust packages outputs with git hash replaced
@@ -195,6 +196,11 @@
               {
                 pkg = rustPackageOutputsFinal.gateway-pkgs;
                 bin = "gateway-cli";
+              };
+            fedimint-load-test-tool = pickBinary
+              {
+                pkg = rustPackageOutputsFinal.fedimint-load-test-tool;
+                bin = "fedimint-load-test-tool";
               };
           };
 
