@@ -136,7 +136,6 @@ pub async fn handle_ng_command(
                 .spend_notes(amount, Duration::from_secs(30), ())
                 .await?;
             info!("Spend e-cash operation: {operation:?}");
-
             Ok(serde_json::to_value(notes).unwrap())
         }
         ClientNg::LnInvoice {
