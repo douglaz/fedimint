@@ -7,7 +7,6 @@ use anyhow::{anyhow, bail, Result};
 use bitcoin::secp256k1;
 use devimint::cmd;
 use devimint::util::ToCmdExt;
-use fedimint_client::module::IPrimaryClientModule;
 use fedimint_client::secret::PlainRootSecretStrategy;
 use fedimint_client::sm::OperationId;
 use fedimint_client::transaction::TransactionBuilder;
@@ -51,7 +50,7 @@ pub async fn try_get_notes_cli(
             Ok(notes) => return Ok(notes),
             Err(e) => {
                 info!("Failed to get notes from cli: {e}, trying again after a second...");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                fedimint_core::task::sleep(Duration::from_secs(1)).await;
             }
         }
     }
@@ -66,7 +65,7 @@ pub async fn reissue_notes(
     let m = fedimint_core::time::now();
     let operation_id = client.reissue_external_notes(notes, ()).await?;
     let mut updates = client
-        .subscribe_reissue_external_notes_updates(operation_id)
+        .subscribe_reissue_external_notes(operation_id)
         .await?
         .into_stream();
     while let Some(update) = updates.next().await {
@@ -89,7 +88,7 @@ pub async fn do_spend_notes(
         .spend_notes(amount, Duration::from_secs(600), ())
         .await?;
     let mut updates = client
-        .subscribe_spend_notes_updates(operation_id)
+        .subscribe_spend_notes(operation_id)
         .await?
         .into_stream();
     if let Some(update) = updates.next().await {
@@ -109,7 +108,7 @@ pub async fn await_spend_notes_finish(
     operation_id: OperationId,
 ) -> anyhow::Result<()> {
     let mut updates = client
-        .subscribe_spend_notes_updates(operation_id)
+        .subscribe_spend_notes(operation_id)
         .await?
         .into_stream();
     while let Some(update) = updates.next().await {
@@ -190,13 +189,8 @@ pub async fn gateway_pay_invoice(
     event_sender: &mpsc::UnboundedSender<MetricEvent>,
 ) -> anyhow::Result<()> {
     let m = fedimint_core::time::now();
-    let operation_id = client
-        .pay_bolt11_invoice(client.federation_id(), invoice)
-        .await?;
-    let mut updates = client
-        .subscribe_ln_pay_updates(operation_id)
-        .await?
-        .into_stream();
+    let operation_id = client.pay_bolt11_invoice(invoice).await?;
+    let mut updates = client.subscribe_ln_pay(operation_id).await?.into_stream();
     while let Some(update) = updates.next().await {
         info!("LnPayState update: {update:?}");
         match update {
@@ -298,7 +292,7 @@ pub async fn remint_denomination(
             out_idx: i as u64,
         };
         mint_client
-            .await_primary_module_output_finalized(operation_id, out_point)
+            .await_output_finalized(operation_id, out_point)
             .await?;
     }
     Ok(())

@@ -13,9 +13,7 @@ use common::{
 };
 use devimint::cmd;
 use fedimint_client::Client;
-use fedimint_core::api::{
-    GlobalFederationApi, IFederationApi, WsClientConnectInfo, WsFederationApi,
-};
+use fedimint_core::api::{GlobalFederationApi, WsClientConnectInfo, WsFederationApi};
 use fedimint_core::config::{load_from_file, ClientConfig};
 use fedimint_core::task::TaskGroup;
 use fedimint_core::util::BoxFuture;
@@ -211,8 +209,7 @@ async fn main() -> anyhow::Result<()> {
                     };
                     let connect_obj: WsClientConnectInfo =
                         WsClientConnectInfo::from_str(&connect).context("invalid connect info")?;
-                    let api = Arc::new(WsFederationApi::from_connect_info(&[connect_obj.clone()]))
-                        as Arc<dyn IFederationApi + Send + Sync + 'static>;
+                    let api = Arc::new(WsFederationApi::from_connect_info(&[connect_obj.clone()]));
                     api.download_client_config(&connect_obj).await?
                 }
             };
@@ -297,7 +294,7 @@ async fn run_load_test(
 ) -> anyhow::Result<Vec<BoxFuture<'static, anyhow::Result<()>>>> {
     let mut tg = TaskGroup::new();
     // FIXME: if we try to reuse a db, we enter a deadlock
-    let db_path = None::<PathBuf>; //archive_dir.as_ref().map(|p| p.join("db"));
+    let db_path = archive_dir.as_ref().map(|p| p.join("db"));
     let coordinator_db = if let Some(db_path) = &db_path {
         tokio::fs::create_dir_all(db_path).await?;
         Some(db_path.join("coordinator.db"))
@@ -443,8 +440,7 @@ async fn test_download_config(
 ) -> anyhow::Result<Vec<BoxFuture<'static, anyhow::Result<()>>>> {
     let connect_obj: WsClientConnectInfo =
         WsClientConnectInfo::from_str(connect).context("invalid connect info")?;
-    let api = Arc::new(WsFederationApi::from_connect_info(&[connect_obj.clone()]))
-        as Arc<dyn IFederationApi + Send + Sync + 'static>;
+    let api = Arc::new(WsFederationApi::from_connect_info(&[connect_obj.clone()]));
 
     Ok((0..users)
         .map(|_| {
@@ -510,19 +506,30 @@ async fn handle_metrics_summary(
             }
         }
         let new_metric_output = archive_metrics.join(format!("{timestamp_seconds}.json",));
-        let new_metric_output = BufWriter::new(tokio::fs::File::create(new_metric_output).await?);
+        let new_metric_output = BufWriter::new(
+            tokio::fs::OpenOptions::new()
+                .create(true)
+                .open(new_metric_output)
+                .await?,
+        );
         metrics_json_output_files.push(new_metric_output);
         if !previous_metrics.is_empty() {
             let new_comparison_output =
                 archive_comparisons.join(format!("{timestamp_seconds}.json",));
             comparison_output = Some(BufWriter::new(
-                tokio::fs::File::create(new_comparison_output).await?,
+                tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .open(new_comparison_output)
+                    .await?,
             ));
         }
     }
     if let Some(metrics_json_output) = opts.metrics_json_output {
         metrics_json_output_files.push(BufWriter::new(
-            tokio::fs::File::create(metrics_json_output).await?,
+            tokio::fs::OpenOptions::new()
+                .create(true)
+                .open(metrics_json_output)
+                .await?,
         ))
     }
 
