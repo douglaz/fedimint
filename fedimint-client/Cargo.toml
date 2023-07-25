@@ -34,8 +34,9 @@ serde_json = "1.0.91"
 strum = "0.24.1"
 strum_macros = "0.24.1"
 thiserror = "1.0.39"
-tokio = { version = "1.26.0", features = [ "time", "macros" ] }
+tokio = { version = "1.26.0", features = [ "macros" ] }
 tracing = "0.1.37"
 
 [dev-dependencies]
+tokio = { version = "1.26.0", features = [ "time" ] }
 tracing-test = "0.2.4"
