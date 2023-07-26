@@ -1,5 +1,7 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -20,7 +22,7 @@ struct Cmd {
     #[clap(long, env = "FM_CLN_SOCKET")]
     cln_socket: String,
     #[clap(long, env = "FM_CONNECT_STRING")]
-    connect_string: String,
+    connect_string: Option<String>,
 }
 
 #[derive(Clone)]
@@ -35,7 +37,11 @@ impl Faucet {
         let url = cmd.bitcoind_rpc.parse()?;
         let (host, auth) = fedimint_bitcoind::bitcoincore::from_url_to_url_auth(&url)?;
         let bitcoin = Arc::new(bitcoincore_rpc::Client::new(&host, auth)?);
-        let ln_rpc = Arc::new(Mutex::new(ClnRpc::new(&cmd.cln_socket).await?));
+        let ln_rpc = Arc::new(Mutex::new(
+            ClnRpc::new(&cmd.cln_socket)
+                .await
+                .with_context(|| format!("couldn't open CLN socket {}", &cmd.cln_socket))?,
+        ));
         Ok(Faucet { bitcoin, ln_rpc })
     }
 
@@ -97,7 +103,13 @@ async fn main() -> anyhow::Result<()> {
     let router = Router::new()
         .route(
             "/connect-string",
-            get(|| async move { cmd.connect_string.clone() }),
+            get(|| async move {
+                cmd.connect_string.unwrap_or_else(|| {
+                    // return error if not set
+                    let data_dir = std::env::var("FM_DATA_DIR").unwrap();
+                    std::fs::read_to_string(PathBuf::from(data_dir).join("client-connect")).unwrap()
+                })
+            }),
         )
         .route(
             "/pay",
