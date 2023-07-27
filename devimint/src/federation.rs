@@ -160,7 +160,7 @@ impl Federation {
         let Some((_, fedimintd)) = self.members.remove_entry(&peer_id) else {
             return Err(anyhow!("fedimintd-{} does not exist", peer_id));
         };
-        fedimintd.kill().await?;
+        fedimintd.terminate().await?;
         Ok(())
     }
 
@@ -311,9 +311,8 @@ impl Fedimintd {
         })
     }
 
-    pub async fn kill(self) -> Result<()> {
-        self.process.kill().await?;
-        Ok(())
+    pub async fn terminate(self) -> Result<()> {
+        self.process.terminate().await
     }
 }
 
