@@ -34,7 +34,7 @@ fedimint-wallet-client = { path = "../modules/fedimint-wallet-client", default-f
 fedimint-wallet-common = { path = "../modules/fedimint-wallet-common", default-features = false }
 itertools = "0.10.5"
 rand = "0.8"
-ring = "0.16.20"
+ring = { git = "https://github.com/fedibtc/ring", branch = "main" }
 reqwest = { version = "0.11.14", features = [ "json", "rustls-tls" ], default-features = false }
 secp256k1 = "0.24.2"
 secp256k1-zkp = { version = "0.7.0", features = [ "serde", "bitcoin_hashes" ] }
@@ -57,7 +57,7 @@ jsonrpsee-ws-client = { version = "0.18.0", features = ["webpki-tls"], default-f
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 jsonrpsee-wasm-client = { version = "0.18.0" }
-ring = { version = "0.16.20", features = ["wasm32_unknown_unknown_js"] }
+ring = { git = "https://github.com/fedibtc/ring", branch = "main", features = ["wasm32_unknown_unknown_js"] }
 
 [dev-dependencies]
 tokio = { version = "1.26.0", features = ["full"] }

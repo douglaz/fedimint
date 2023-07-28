@@ -90,4 +90,5 @@ debug = 1
 
 [patch.crates-io]
 secp256k1-zkp = { git = "https://github.com/dpc/rust-secp256k1-zkp/", branch = "sanket-pr" }
-ring = { git = "https://github.com/Maan2003/ring", rev = "52a1294a8fc066cc0656911ec22b8358fb763ef1" }
+# ring = { git = "https://github.com/Maan2003/ring", rev = "52a1294a8fc066cc0656911ec22b8358fb763ef1" }
+# ring = { git = "https://github.com/fedibtc/ring", branch = "main" }

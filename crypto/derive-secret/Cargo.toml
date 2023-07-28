@@ -16,6 +16,6 @@ path = "src/lib.rs"
 anyhow = "1.0.66"
 fedimint-core ={ path = "../../fedimint-core" }
 hkdf = { path = "../../crypto/hkdf" }
-ring = "0.16.20"
+ring = { git = "https://github.com/fedibtc/ring", branch = "main" }
 secp256k1-zkp = { version = "0.7.0", features = [ "serde", "bitcoin_hashes" ] }
 tbs = { path = "../../crypto/tbs" }
