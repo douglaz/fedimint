@@ -301,6 +301,14 @@ pub struct ConfigGenModuleParams {
     pub consensus: Option<serde_json::Value>,
 }
 
+/// Description of a module that can may come from the environment
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalModuleDescription {
+    pub id: ModuleInstanceId,
+    pub kind: ModuleKind,
+    pub params: ConfigGenModuleParams,
+}
+
 pub type ServerModuleGenRegistry = ModuleGenRegistry<DynServerModuleGen>;
 
 impl ConfigGenModuleParams {

@@ -5,7 +5,7 @@ use bitcoincore_rpc::bitcoin::Network;
 use fedimint_core::admin_client::{ConfigGenConnectionsRequest, ConfigGenParamsRequest};
 use fedimint_core::api::ServerStatus;
 use fedimint_core::bitcoinrpc::BitcoinRpcConfig;
-use fedimint_core::config::ServerModuleGenParamsRegistry;
+use fedimint_core::config::{ExternalModuleDescription, ServerModuleGenParamsRegistry};
 use fedimint_core::core::LEGACY_HARDCODED_INSTANCE_ID_WALLET;
 use fedimint_core::db::mem_impl::MemDatabase;
 use fedimint_core::module::ApiAuth;
@@ -54,7 +54,14 @@ impl Federation {
             vars.insert(peer.to_usize(), var);
         }
 
-        run_dkg(admin_clients, params).await?;
+        // TODO: probably should come from command line
+        let extra_dkg_modules: Vec<ExternalModuleDescription> =
+            match std::env::var("FM_EXTRA_DKG_MODULES") {
+                Ok(json_list) => serde_json::from_str(&json_list)
+                    .context("error parsing FM_EXTRA_DKG_MODULES")?,
+                Err(_) => vec![],
+            };
+        run_dkg(admin_clients, params, extra_dkg_modules).await?;
 
         let out_dir = &vars[&0].FM_DATA_DIR;
         let cfg_dir = &process_mgr.globals.FM_DATA_DIR;
@@ -274,6 +281,7 @@ const BASE_PORT: u16 = 8173 + 10000;
 pub async fn run_dkg(
     admin_clients: BTreeMap<PeerId, WsAdminClient>,
     params: HashMap<PeerId, ConfigGenParams>,
+    extra_dkg_modules: Vec<ExternalModuleDescription>,
 ) -> anyhow::Result<()> {
     let auth_for = |peer: &PeerId| -> ApiAuth { params[peer].local.api_auth.clone() };
     for (peer_id, client) in &admin_clients {
@@ -319,7 +327,13 @@ pub async fn run_dkg(
         .get_default_config_gen_params(auth_for(leader_id))
         .await?; // sanity check
     let server_gen_params = params[leader_id].consensus.modules.clone();
-    set_config_gen_params(leader, auth_for(leader_id), server_gen_params.clone()).await?;
+    set_config_gen_params(
+        leader,
+        auth_for(leader_id),
+        server_gen_params.clone(),
+        extra_dkg_modules.clone(),
+    )
+    .await?;
     let followers_names = followers
         .keys()
         .map(|peer_id| {
@@ -348,7 +362,13 @@ pub async fn run_dkg(
                 auth_for(peer_id),
             )
             .await?;
-        set_config_gen_params(client, auth_for(peer_id), server_gen_params.clone()).await?;
+        set_config_gen_params(
+            client,
+            auth_for(peer_id),
+            server_gen_params.clone(),
+            extra_dkg_modules.clone(),
+        )
+        .await?;
     }
     let found_names = leader
         .get_config_gen_peers()
@@ -370,7 +390,9 @@ pub async fn run_dkg(
 
     let mut configs = vec![];
     for client in admin_clients.values() {
-        configs.push(client.get_consensus_config_gen_params().await?);
+        let config = client.get_consensus_config_gen_params().await?;
+        info!("Got config: {config:?}");
+        configs.push(config);
     }
     // Confirm all consensus configs are the same
     let mut consensus: Vec<_> = configs.iter().map(|p| p.consensus.clone()).collect();
@@ -438,6 +460,7 @@ async fn set_config_gen_params(
     client: &WsAdminClient,
     auth: ApiAuth,
     mut server_gen_params: ServerModuleGenParamsRegistry,
+    extra_dkg_modules: Vec<ExternalModuleDescription>,
 ) -> anyhow::Result<()> {
     attach_default_module_gen_params(
         BitcoinRpcConfig::from_env_vars()?,
@@ -446,6 +469,9 @@ async fn set_config_gen_params(
         Network::Regtest,
         10,
     );
+    for module in extra_dkg_modules {
+        server_gen_params.register_module(module.id, module.kind, module.params);
+    }
     let request = ConfigGenParamsRequest {
         meta: BTreeMap::from([("test".to_string(), "testvalue".to_string())]),
         modules: server_gen_params,
