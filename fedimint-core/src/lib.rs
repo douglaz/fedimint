@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 pub use tiered::Tiered;
 pub use tiered_multi::*;
+pub use tokio_util::sync::*;
 
 pub use crate::core::server;
 use crate::encoding::{Decodable, DecodeError, Encodable};

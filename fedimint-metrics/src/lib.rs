@@ -26,27 +26,25 @@ async fn get_metrics() -> (StatusCode, String) {
     }
 }
 
-pub async fn run_api_server(
+pub async fn run_api_server<'a>(
     bind_address: &SocketAddr,
-    task_group: &mut TaskGroup,
-) -> anyhow::Result<oneshot::Receiver<()>> {
+    task_group: &'a mut TaskGroup,
+) -> anyhow::Result<fedimint_core::WaitForCancellationFutureOwned> {
     let app = Router::new().route("/metrics", get(get_metrics));
     let server = axum::Server::bind(bind_address).serve(app.into_make_service());
 
     let handle = task_group.make_handle();
-    let shutdown_rx = handle.make_shutdown_rx().await;
+    let shutdown_rx = handle.make_shutdown_rx_owned().await;
     task_group
         .spawn("Metrics Api", move |_| async move {
-            let graceful = server.with_graceful_shutdown(async {
-                shutdown_rx.await.ok();
-            });
+            let graceful = server.with_graceful_shutdown(shutdown_rx);
 
             if let Err(e) = graceful.await {
                 error!("Error shutting down metrics api: {e:?}");
             }
         })
         .await;
-    let shutdown_receiver = handle.make_shutdown_rx().await;
+    let shutdown_receiver = handle.make_shutdown_rx_owned().await;
 
     Ok(shutdown_receiver)
 }

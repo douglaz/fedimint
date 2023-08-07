@@ -20,6 +20,9 @@ use thiserror::Error;
 use tokio::sync::oneshot;
 #[cfg(not(target_family = "wasm"))]
 use tokio::task::{JoinError, JoinHandle};
+use tokio_util::sync::{
+    CancellationToken, WaitForCancellationFuture, WaitForCancellationFutureOwned,
+};
 use tracing::{error, info, warn};
 
 #[cfg(target_family = "wasm")]
@@ -36,27 +39,19 @@ struct TaskGroupInner {
     /// Was the shutdown requested, either externally or due to any task
     /// failure?
     is_shutting_down: AtomicBool,
-    #[allow(clippy::type_complexity)]
-    on_shutdown: Mutex<Vec<Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send + 'static>>>,
+    // #[allow(clippy::type_complexity)]
+    // on_shutdown: Mutex<Vec<Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send + 'static>>>,
     join: Mutex<VecDeque<(String, JoinHandle<()>)>>,
     subgroups: Mutex<Vec<TaskGroup>>,
+    cancellation_token: tokio_util::sync::CancellationToken,
 }
 
 impl TaskGroupInner {
-    pub async fn shutdown(&self) {
+    pub fn shutdown(&self) {
         // Note: set the flag before starting to call shutdown handlers
         // to avoid confusion.
         self.is_shutting_down.store(true, SeqCst);
-
-        loop {
-            let f_opt = self.on_shutdown.lock().await.pop();
-
-            if let Some(f) = f_opt {
-                f().await;
-            } else {
-                break;
-            }
-        }
+        self.cancellation_token.cancel();
     }
 }
 /// A group of task working together
@@ -98,31 +93,25 @@ impl TaskGroup {
     /// [`Self::join_all`]. If it won't, the parent subgroup **will not**
     /// detect any panics in the tasks spawned by the subgroup.
     pub async fn make_subgroup(&self) -> TaskGroup {
-        let new_tg = Self::new();
+        let new_tg = TaskGroup {
+            inner: Arc::new(TaskGroupInner {
+                cancellation_token: self.inner.cancellation_token.child_token(),
+                ..Default::default()
+            }),
+        };
         self.inner.subgroups.lock().await.push(new_tg.clone());
-        self.make_handle()
-            .on_shutdown({
-                let new_tg = self.clone();
-                Box::new(move || {
-                    Box::pin(async move {
-                        new_tg.shutdown().await;
-                    })
-                })
-            })
-            .await;
-
         new_tg
     }
 
-    pub async fn shutdown(&self) {
-        self.inner.shutdown().await
+    pub fn shutdown(&self) {
+        self.inner.shutdown()
     }
 
     pub async fn shutdown_join_all(
         self,
         join_timeout: Option<Duration>,
     ) -> Result<(), anyhow::Error> {
-        self.shutdown().await;
+        self.shutdown();
         self.join_all(join_timeout).await
     }
 
@@ -161,7 +150,7 @@ impl TaskGroup {
                     target: LOG_TASK,
                     "signal received, starting graceful shutdown"
                 );
-                task_group.shutdown().await;
+                task_group.shutdown();
             }
         });
     }
@@ -355,40 +344,16 @@ impl TaskHandle {
         self.inner.is_shutting_down.load(SeqCst)
     }
 
-    /// Run `f` on shutdown.
-    ///
-    /// If TaskGroup is already shutting down, run the function immediately.
-    async fn on_shutdown(
-        &self,
-        // f: FnOnce() -> BoxFuture<'static, ()> + Send + 'static
-        f: Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send + 'static>,
-    ) {
-        // NOTE: hold the lock to avoid race if shutdown happens immediately after
-        // checking here.
-        let mut on_shutdown = self.inner.on_shutdown.lock().await;
-        if self.is_shutting_down() {
-            // release lock before calling f.
-            drop(on_shutdown);
-            f().await;
-        } else {
-            on_shutdown.push(f);
-        }
-    }
-
     /// Make a [`oneshot::Receiver`] that will fire on shutdown
     ///
     /// Tasks can use `select` on the return value to handle shutdown
     /// signal during otherwise blocking operation.
-    pub async fn make_shutdown_rx(&self) -> oneshot::Receiver<()> {
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        self.on_shutdown(Box::new(|| {
-            Box::pin(async {
-                let _ = shutdown_tx.send(());
-            })
-        }))
-        .await;
+    pub async fn make_shutdown_rx(&self) -> WaitForCancellationFuture {
+        self.inner.cancellation_token.cancelled()
+    }
 
-        shutdown_rx
+    pub async fn make_shutdown_rx_owned(&self) -> WaitForCancellationFutureOwned {
+        self.inner.cancellation_token.clone().cancelled_owned()
     }
 }
 

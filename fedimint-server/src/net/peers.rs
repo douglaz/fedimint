@@ -267,7 +267,7 @@ where
             .with_context(|| anyhow::anyhow!("Failed to listen on {}", cfg.bind_addr))
             .expect("Could not bind port");
 
-        let mut shutdown_rx = task_handle.make_shutdown_rx().await;
+        let mut shutdown_rx = task_handle.make_shutdown_rx_owned().await;
 
         while !task_handle.is_shutting_down() {
             let new_connection = tokio::select! {
