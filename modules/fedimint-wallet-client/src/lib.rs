@@ -36,7 +36,7 @@ pub use fedimint_wallet_common::*;
 use futures::{Stream, StreamExt};
 use miniscript::ToPublicKey;
 use rand::{thread_rng, Rng};
-use secp256k1::{All, Secp256k1};
+use secp256k1::{All, KeyPair, Secp256k1};
 use serde::{Deserialize, Serialize};
 
 use crate::api::WalletFederationApi;
@@ -51,7 +51,7 @@ pub trait WalletClientExt {
     async fn get_deposit_address(
         &self,
         valid_until: SystemTime,
-    ) -> anyhow::Result<(OperationId, Address)>;
+    ) -> anyhow::Result<(OperationId, Address, KeyPair)>;
 
     async fn subscribe_deposit_updates(
         &self,
@@ -112,16 +112,16 @@ impl WalletClientExt for Client {
     async fn get_deposit_address(
         &self,
         valid_until: SystemTime,
-    ) -> anyhow::Result<(OperationId, Address)> {
+    ) -> anyhow::Result<(OperationId, Address, KeyPair)> {
         let (wallet_client, instance) =
             self.get_first_module::<WalletClientModule>(&WalletCommonGen::KIND);
 
-        let (operation_id, address) = self
+        let (operation_id, address, keypair) = self
             .db()
             .autocommit(
                 |dbtx| {
                     Box::pin(async move {
-                        let (operation_id, sm, address) = wallet_client
+                        let (operation_id, sm, address, keypair) = wallet_client
                             .get_deposit_address(
                                 valid_until,
                                 &mut dbtx.with_module_prefix(instance.id),
@@ -148,7 +148,7 @@ impl WalletClientExt for Client {
                             )
                             .await;
 
-                        Ok((operation_id, address))
+                        Ok((operation_id, address, keypair))
                     })
                 },
                 Some(100),
@@ -162,7 +162,7 @@ impl WalletClientExt for Client {
                 AutocommitError::ClosureError { error, .. } => error,
             })?;
 
-        Ok((operation_id, address))
+        Ok((operation_id, address, keypair))
     }
 
     async fn subscribe_deposit_updates(
@@ -497,7 +497,7 @@ impl WalletClientModule {
         &self,
         valid_until: SystemTime,
         dbtx: &mut ModuleDatabaseTransaction<'_>,
-    ) -> (OperationId, WalletClientStates, Address) {
+    ) -> (OperationId, WalletClientStates, Address, KeyPair) {
         let tweak_key = self
             .module_root_secret
             .child_key(WALLET_TWEAK_CHILD_ID)
@@ -522,7 +522,7 @@ impl WalletClientModule {
             }),
         });
 
-        (operation_id, deposit_sm, address)
+        (operation_id, deposit_sm, address, tweak_key)
     }
 
     pub async fn get_withdraw_fees(

@@ -776,7 +776,7 @@ impl Gateway {
     }
 
     pub async fn handle_address_msg(&self, payload: DepositAddressPayload) -> Result<Address> {
-        let (_, address) = self
+        let (_, address, _) = self
             .select_client(payload.federation_id)
             .await?
             .get_deposit_address(now() + Duration::from_secs(86400 * 365))

@@ -1,5 +1,7 @@
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use fedimint_client::transaction::ClientInput;
 use fedimint_client::Client;
 use fedimint_core::util::{BoxStream, NextOrPending};
 use fedimint_core::{sats, Amount, Feerate};
@@ -8,9 +10,12 @@ use fedimint_dummy_common::config::DummyGenParams;
 use fedimint_dummy_server::DummyGen;
 use fedimint_testing::btc::BitcoinTest;
 use fedimint_testing::fixtures::Fixtures;
-use fedimint_wallet_client::{DepositState, WalletClientExt, WalletClientGen, WithdrawState};
+use fedimint_wallet_client::{
+    DepositState, WalletClientExt, WalletClientGen, WalletClientStates, WithdrawState,
+};
 use fedimint_wallet_common::config::WalletGenParams;
-use fedimint_wallet_common::PegOutFees;
+use fedimint_wallet_common::txoproof::PegInProof;
+use fedimint_wallet_common::{PegOutFees, WalletInput};
 use fedimint_wallet_server::WalletGen;
 use futures::stream::StreamExt;
 
@@ -39,7 +44,7 @@ async fn peg_in<'a>(
     let mut balance_sub = client.subscribe_balance_changes().await;
     assert_eq!(balance_sub.ok().await?, sats(0));
 
-    let (op, address) = client.get_deposit_address(valid_until).await?;
+    let (op, address, _) = client.get_deposit_address(valid_until).await?;
     bitcoin
         .send_and_mine_block(&address, bsats(PEG_IN_AMOUNT_SATS))
         .await;
@@ -129,6 +134,44 @@ async fn peg_out_fail_refund() -> anyhow::Result<()> {
     // Check that we get our money back if the peg-out fails
     assert_eq!(balance_sub.next().await.unwrap(), sats(PEG_IN_AMOUNT_SATS));
     assert_eq!(client.get_balance().await, sats(PEG_IN_AMOUNT_SATS));
+
+    Ok(())
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn peg_ins_that_are_unconfirmed_are_rejected() -> anyhow::Result<()> {
+    let fixtures = fixtures();
+    let fed = fixtures.new_fed().await;
+    let client = fed.new_client().await;
+    let bitcoin = fixtures.bitcoin();
+
+    let finality_delay = 10;
+    bitcoin.mine_blocks(finality_delay).await;
+    let valid_until = SystemTime::now() + PEG_IN_TIMEOUT;
+
+    let (op, address, keypair) = client.get_deposit_address(valid_until).await?;
+    let (txout_proof, btc_transaction) = bitcoin
+        .send_and_mine_block(&address, bsats(PEG_IN_AMOUNT_SATS))
+        .await;
+    let sub = client.subscribe_deposit_updates(op).await?;
+    let mut sub = sub.into_stream();
+    assert_eq!(sub.ok().await?, DepositState::WaitingForTransaction);
+    assert_eq!(sub.ok().await?, DepositState::WaitingForConfirmation);
+    let out_idx = 0; // FIXME: get from somewhere?
+    let wallet_input = WalletInput(Box::new(PegInProof::new(
+        txout_proof,
+        btc_transaction,
+        out_idx,
+        keypair.x_only_public_key().0,
+    )?));
+    let client_input = ClientInput::<WalletInput, WalletClientStates> {
+        input: wallet_input,
+        keys: vec![keypair],
+        state_machines: Arc::new(|_, _| vec![]),
+    };
+
+    let (fm_txid, change) = client.claim_input(dbtx, client_input).await;
+
+    // then track transaction to make sure it fails...
 
     Ok(())
 }
