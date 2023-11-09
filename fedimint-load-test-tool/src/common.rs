@@ -127,14 +127,14 @@ pub async fn await_spend_notes_finish(
 pub async fn build_client(
     invite_code: Option<InviteCode>,
     rocksdb: Option<&PathBuf>,
-) -> anyhow::Result<Client> {
+) -> anyhow::Result<(Client, Option<InviteCode>)> {
     let mut client_builder = ClientBuilder::default();
     client_builder.with_module(MintClientGen);
     client_builder.with_module(LightningClientGen);
     client_builder.with_module(WalletClientGen::default());
     client_builder.with_primary_module(1);
-    if let Some(invite_code) = invite_code {
-        client_builder.with_invite_code(invite_code);
+    if let Some(invite_code) = &invite_code {
+        client_builder.with_invite_code(invite_code.to_owned());
     }
     if let Some(rocksdb) = rocksdb {
         client_builder.with_database(fedimint_rocksdb::RocksDb::open(rocksdb)?)
@@ -142,7 +142,7 @@ pub async fn build_client(
         client_builder.with_database(fedimint_core::db::mem_impl::MemDatabase::new())
     }
     let client = client_builder.build::<PlainRootSecretStrategy>().await?;
-    Ok(client)
+    Ok((client, invite_code))
 }
 
 pub async fn lnd_create_invoice(amount: Amount) -> anyhow::Result<(Invoice, String)> {
@@ -159,6 +159,24 @@ pub async fn lnd_create_invoice(amount: Amount) -> anyhow::Result<(Invoice, Stri
         .context("Missing r_hash field")?
         .to_owned();
     Ok((invoice, r_hash))
+}
+
+pub async fn lnd_pay_invoice(invoice: Invoice) -> anyhow::Result<()> {
+    let status = cmd!(
+        LnCli,
+        "payinvoice",
+        "--force",
+        "--allow_self_payment",
+        "--json",
+        invoice.to_string()
+    )
+    .out_json()
+    .await?["status"]
+        .as_str()
+        .context("Missing status field")?
+        .to_owned();
+    anyhow::ensure!(status == "SUCCEEDED");
+    Ok(())
 }
 
 pub async fn lnd_wait_invoice_payment(r_hash: String) -> anyhow::Result<()> {
@@ -214,6 +232,17 @@ pub async fn cln_create_invoice(amount: Amount) -> anyhow::Result<(Invoice, Stri
         .context("Missing bolt11 field")?
         .to_owned();
     Ok((Invoice::from_str(&invoice_string)?, label))
+}
+
+pub async fn cln_pay_invoice(invoice: Invoice) -> anyhow::Result<()> {
+    let status = cmd!(ClnLightningCli, "pay", invoice.to_string())
+        .out_json()
+        .await?["status"]
+        .as_str()
+        .context("Missing status field")?
+        .to_owned();
+    anyhow::ensure!(status == "complete");
+    Ok(())
 }
 
 pub async fn cln_wait_invoice_payment(label: &str) -> anyhow::Result<()> {
@@ -276,7 +305,10 @@ pub async fn remint_denomination(
         )
         .await?;
     let tx_subscription = client.transaction_updates(operation_id).await;
-    tx_subscription.await_tx_accepted(txid).await?;
+    tx_subscription
+        .await_tx_accepted(txid)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     dbtx.commit_tx().await;
     for i in 0..quantity {
         let out_point = OutPoint {

@@ -105,6 +105,7 @@ declare_vars! {
         FM_GATEWAY_LISTEN_ADDR: String = "127.0.0.1:8175";
         FM_GATEWAY_API_ADDR: String = "http://127.0.0.1:8175";
         FM_GATEWAY_PASSWORD: String = "theresnosecondbest";
+        FM_GATEWAY_FEES: String = "0,0"; // Enable to us to make an unbounded number of payments
 
         FM_CLN_EXTENSION_LISTEN_ADDRESS: String = "0.0.0.0:8177";
         FM_GATEWAY_LIGHTNING_ADDR: String = "http://localhost:8177";
