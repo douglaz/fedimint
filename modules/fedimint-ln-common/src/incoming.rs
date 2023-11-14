@@ -21,7 +21,7 @@ use fedimint_core::{Amount, OutPoint, TransactionId};
 use lightning_invoice::Invoice;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::error;
+use tracing::{error, info, warn};
 
 use crate::api::LnFederationApi;
 use crate::contracts::incoming::IncomingContractAccount;
@@ -153,6 +153,7 @@ impl FundingOfferState {
         out_point: OutPoint,
         context: LightningClientContext,
     ) -> Result<(), IncomingSmError> {
+        info!("Awaiting funding success for outpoint: {out_point:?}");
         global_context
             .api()
             .await_output_outcome::<LightningOutputOutcome>(
@@ -164,6 +165,7 @@ impl FundingOfferState {
             .map_err(|e| IncomingSmError::FailedToFundContract {
                 error_message: e.to_string(),
             })?;
+        info!("Funding success for outpoint: {out_point:?}");
         Ok(())
     }
 
@@ -226,6 +228,7 @@ impl DecryptingPreimageState {
     ) -> Result<Preimage, IncomingSmError> {
         // TODO: Get rid of polling
         let preimage = loop {
+            info!("Polling for preimage for contract {contract_id:?}");
             let contract = global_context
                 .module_api()
                 .get_incoming_contract(contract_id)
@@ -233,15 +236,22 @@ impl DecryptingPreimageState {
 
             match contract {
                 Ok(contract) => match contract.contract.decrypted_preimage {
-                    DecryptedPreimage::Pending => {}
-                    DecryptedPreimage::Some(preimage) => break preimage,
+                    DecryptedPreimage::Pending => {
+                        info!("Preimage still pending for contract {contract_id:?}");
+                    }
+                    DecryptedPreimage::Some(preimage) => {
+                        info!("Preimage found for contract {contract_id:?}");
+                        break preimage;
+                    }
                     DecryptedPreimage::Invalid => {
+                        warn!("Preimage invalid for contract {contract_id:?}");
                         return Err(IncomingSmError::InvalidPreimage {
                             contract: Box::new(contract),
                         });
                     }
                 },
                 Err(e) => {
+                    warn!("Error fetching contract {e:?}");
                     error!("Failed to fetch contract {e:?}");
                 }
             }
@@ -289,6 +299,7 @@ impl DecryptingPreimageState {
         old_state: IncomingStateMachine,
         contract: Box<IncomingContractAccount>,
     ) -> IncomingStateMachine {
+        info!("Refunding incoming contract {contract:?}");
         let claim_input = contract.claim();
         let client_input = ClientInput::<LightningInput, IncomingStateMachine> {
             input: claim_input,
@@ -297,6 +308,7 @@ impl DecryptingPreimageState {
         };
 
         let (refund_txid, _) = global_context.claim_input(dbtx, client_input).await;
+        info!("Refunded incoming contract {contract:?} with txid {refund_txid:?}");
 
         IncomingStateMachine {
             common: old_state.common,

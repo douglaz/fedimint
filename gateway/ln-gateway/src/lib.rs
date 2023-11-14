@@ -302,12 +302,14 @@ impl Gateway {
                 move |handle| async move {
                     loop {
                         if handle.is_shutting_down() {
+                            info!("Received shutdown signal, exiting...");
                             break;
                         }
 
                         let mut htlc_task_group = tg.make_subgroup().await;
                         let lnrpc_route = self.lightning_builder.build().await;
 
+                        info!("Will try to intercept HTLC stream...");
                         // Re-create the HTLC stream if the connection breaks
                         match lnrpc_route
                             .route_htlcs(&mut htlc_task_group)
@@ -372,11 +374,16 @@ impl Gateway {
             lightning_alias: _,
         } = self.state.read().await.clone()
         {
-            while let Some(Ok(htlc_request)) = stream.next().await {
+            loop {
+                let Some(Ok(htlc_request)) = stream.next().await else {
+                    info!("Stream finished, exiting...");
+                    break;
+                };
                 if handle.is_shutting_down() {
+                    info!("Received shutdown signal while handling htlc stream, exiting...");
                     break;
                 }
-
+                info!("Received HTLC request: {htlc_request:?}");
                 let scid_to_feds = self.scid_to_federation.read().await;
                 let federation_id = scid_to_feds.get(&htlc_request.short_channel_id);
                 // Just forward the HTLC if we do not have a federation that
@@ -395,7 +402,7 @@ impl Gateway {
                         }
                     }
                 }
-
+                info!("Forwarding HTLC to lightning node: {htlc_request:?}");
                 let outcome = InterceptHtlcResponse {
                     action: Some(Action::Forward(Forward {})),
                     incoming_chan_id: htlc_request.incoming_chan_id,
@@ -512,6 +519,7 @@ impl Gateway {
     }
 
     async fn handle_pay_invoice_msg(&self, payload: PayInvoicePayload) -> Result<Preimage> {
+        info!("Handling pay invoice message: {payload:?}");
         if let GatewayState::Running {
             lnrpc: _,
             lightning_public_key: _,
@@ -524,7 +532,9 @@ impl Gateway {
             } = payload;
 
             let client = self.select_client(federation_id).await?;
+            info!("Paying invoice: {contract_id}");
             let operation_id = client.gateway_pay_bolt11_invoice(contract_id).await?;
+            info!("Getting updates for invoice payment on {contract_id}");
             let mut updates = client
                 .gateway_subscribe_ln_pay(operation_id)
                 .await?
@@ -535,18 +545,24 @@ impl Gateway {
                     GatewayExtPayStates::Success {
                         preimage,
                         outpoint: _,
-                    } => return Ok(preimage),
+                    } => {
+                        info!("Successfully paid invoice: {contract_id}");
+                        return Ok(preimage);
+                    }
                     GatewayExtPayStates::Fail {
                         error,
                         error_message,
                     } => {
-                        error!(error_message);
+                        error!("{error_message} while paying invoice: {contract_id}");
                         return Err(GatewayError::OutgoingPaymentError(Box::new(error)));
                     }
                     GatewayExtPayStates::Canceled { error } => {
+                        error!("Cancelled with {error} while paying invoice: {contract_id}");
                         return Err(GatewayError::OutgoingPaymentError(Box::new(error)));
                     }
-                    _ => {}
+                    other => {
+                        info!("Got state {other:?} while paying invoice: {contract_id}");
+                    }
                 };
             }
 
@@ -891,19 +907,19 @@ pub enum LightningMode {
 
 #[derive(Debug, Error)]
 pub enum GatewayError {
-    #[error("Federation error: {}", OptStracktrace(0))]
+    #[error("Federation error: {}", OptStracktrace(.0))]
     FederationError(#[from] FederationError),
-    #[error("Other: {}", OptStracktrace(0))]
+    #[error("Other: {}", OptStracktrace(.0))]
     ClientStateMachineError(#[from] anyhow::Error),
-    #[error("Failed to open the database: {}", OptStracktrace(0))]
+    #[error("Failed to open the database: {}", OptStracktrace(.0))]
     DatabaseError(anyhow::Error),
     #[error("Federation client error")]
     LightningRpcError(#[from] LightningRpcError),
-    #[error("Outgoing Payment Error {}", OptStracktrace(0))]
+    #[error("Outgoing Payment Error {}", OptStracktrace(.0))]
     OutgoingPaymentError(#[from] Box<OutgoingPaymentError>),
-    #[error("Invalid Metadata: {}", OptStracktrace(0))]
+    #[error("Invalid Metadata: {}", OptStracktrace(.0))]
     InvalidMetadata(String),
-    #[error("Unexpected state: {}", OptStracktrace(0))]
+    #[error("Unexpected state: {}", OptStracktrace(.0))]
     UnexpectedState(String),
     #[error("The gateway is disconnected")]
     Disconnected,

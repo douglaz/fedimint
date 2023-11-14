@@ -14,6 +14,8 @@ use fedimint_ln_common::{LightningInput, LightningOutput};
 use futures::future;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::log::warn;
+use tracing::{error, info};
 
 use super::{GatewayClientContext, GatewayClientStateMachines};
 use crate::gateway_lnrpc::{PayInvoiceRequest, PayInvoiceResponse};
@@ -168,6 +170,7 @@ impl GatewayPayInvoice {
         contract_id: ContractId,
         context: GatewayClientContext,
     ) -> Result<(OutgoingContractAccount, PaymentParameters), OutgoingPaymentError> {
+        info!("Await payment parameters for outgoing contract {contract_id:?}");
         let account = global_context
             .module_api()
             .fetch_contract(contract_id)
@@ -189,6 +192,7 @@ impl GatewayPayInvoice {
                     contract: outgoing_contract_account.clone(),
                 })?;
 
+            info!("Consensus block count: {consensus_block_count:?} for outgoing contract {contract_id:?}");
             if consensus_block_count.is_none() {
                 return Err(OutgoingPaymentError::InvalidOutgoingContract {
                     error: OutgoingContractError::MissingContractData,
@@ -207,10 +211,11 @@ impl GatewayPayInvoice {
                 error: e,
                 contract: outgoing_contract_account.clone(),
             })?;
-
+            info!("Got payment parameters: {payment_parameters:?} for contract {contract_id:?}");
             return Ok((outgoing_contract_account, payment_parameters));
         }
 
+        error!("Contract {contract_id:?} is not an outgoing contract");
         Err(OutgoingPaymentError::OutgoingContractDoesNotExist { contract_id })
     }
 
@@ -248,14 +253,16 @@ impl GatewayPayInvoice {
         result: Result<(OutgoingContractAccount, PaymentParameters), OutgoingPaymentError>,
         common: GatewayPayCommon,
     ) -> GatewayPayStateMachine {
-        match result {
+        match result.clone() {
             Ok((contract, payment_parameters)) => {
+                info!("Buying preimage contract {contract:?}");
                 let preimage_result = Self::buy_preimage_over_lightning(
                     context,
-                    payment_parameters,
+                    payment_parameters.clone(),
                     contract.clone(),
                 )
                 .await;
+                info!("Preimage result: {preimage_result:?} contract {contract:?}");
 
                 match preimage_result {
                     Ok(preimage) => GatewayPayStateMachine {
@@ -272,32 +279,34 @@ impl GatewayPayInvoice {
                     },
                 }
             }
-            Err(e) => match e.clone() {
-                OutgoingPaymentError::InvalidOutgoingContract { error: _, contract } => {
-                    GatewayPayStateMachine {
+            Err(e) => {
+                warn!("Failed to get payment parameters for {result:?}: {e:?}");
+                match e.clone() {
+                    OutgoingPaymentError::InvalidOutgoingContract { error: _, contract } => {
+                        GatewayPayStateMachine {
+                            common,
+                            state: GatewayPayStates::CancelContract(Box::new(
+                                GatewayPayCancelContract { contract, error: e },
+                            )),
+                        }
+                    }
+                    OutgoingPaymentError::LightningPayError {
+                        contract,
+                        lightning_error: _,
+                    } => GatewayPayStateMachine {
                         common,
                         state: GatewayPayStates::CancelContract(Box::new(
                             GatewayPayCancelContract { contract, error: e },
                         )),
+                    },
+                    OutgoingPaymentError::OutgoingContractDoesNotExist { contract_id } => {
+                        GatewayPayStateMachine {
+                            common,
+                            state: GatewayPayStates::OfferDoesNotExist(contract_id),
+                        }
                     }
                 }
-                OutgoingPaymentError::LightningPayError {
-                    contract,
-                    lightning_error: _,
-                } => GatewayPayStateMachine {
-                    common,
-                    state: GatewayPayStates::CancelContract(Box::new(GatewayPayCancelContract {
-                        contract,
-                        error: e,
-                    })),
-                },
-                OutgoingPaymentError::OutgoingContractDoesNotExist { contract_id } => {
-                    GatewayPayStateMachine {
-                        common,
-                        state: GatewayPayStates::OfferDoesNotExist(contract_id),
-                    }
-                }
-            },
+            }
         }
     }
 
@@ -395,6 +404,7 @@ impl GatewayPayClaimOutgoingContract {
         contract: OutgoingContractAccount,
         preimage: Preimage,
     ) -> GatewayPayStateMachine {
+        info!("Claiming outgoing contract {contract:?}");
         let claim_input = contract.claim(preimage.clone());
         let client_input = ClientInput::<LightningInput, GatewayClientStateMachines> {
             input: claim_input,
@@ -403,6 +413,7 @@ impl GatewayPayClaimOutgoingContract {
         };
 
         let (txid, _) = global_context.claim_input(dbtx, client_input).await;
+        info!("Claimed outgoing contract {contract:?} with txid {txid:?}");
         GatewayPayStateMachine {
             common,
             state: GatewayPayStates::Preimage(OutPoint { txid, out_idx: 0 }, preimage),
@@ -448,6 +459,7 @@ impl GatewayPayCancelContract {
         common: GatewayPayCommon,
         error: OutgoingPaymentError,
     ) -> GatewayPayStateMachine {
+        info!("Canceling outgoing contract {contract:?}");
         let cancel_signature = context.secp.sign_schnorr(
             &contract.contract.cancellation_message().into(),
             &context.redeem_key,
@@ -462,23 +474,29 @@ impl GatewayPayCancelContract {
         };
 
         match global_context.fund_output(dbtx, client_output).await {
-            Ok((txid, _)) => GatewayPayStateMachine {
-                common,
-                state: GatewayPayStates::Canceled {
-                    txid,
-                    contract_id: contract.contract.contract_id(),
-                    error,
-                },
-            },
-            Err(e) => GatewayPayStateMachine {
-                common,
-                state: GatewayPayStates::Failed {
-                    error,
-                    error_message: format!(
-                        "Failed to submit refund transaction to federation {e:?}"
-                    ),
-                },
-            },
+            Ok((txid, _)) => {
+                info!("Canceled outgoing contract {contract:?} with txid {txid:?}");
+                GatewayPayStateMachine {
+                    common,
+                    state: GatewayPayStates::Canceled {
+                        txid,
+                        contract_id: contract.contract.contract_id(),
+                        error,
+                    },
+                }
+            }
+            Err(e) => {
+                info!("Failed to cancel outgoing contract {contract:?}: {e:?}");
+                GatewayPayStateMachine {
+                    common,
+                    state: GatewayPayStates::Failed {
+                        error,
+                        error_message: format!(
+                            "Failed to submit refund transaction to federation {e:?}"
+                        ),
+                    },
+                }
+            }
         }
     }
 }
