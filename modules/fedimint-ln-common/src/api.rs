@@ -8,8 +8,8 @@ use fedimint_core::api::{
 use fedimint_core::endpoint_constants::{
     ACCOUNT_ENDPOINT, AWAIT_ACCOUNT_ENDPOINT, AWAIT_BLOCK_HEIGHT_ENDPOINT, AWAIT_OFFER_ENDPOINT,
     AWAIT_OUTGOING_CONTRACT_CANCELLED_ENDPOINT, AWAIT_PREIMAGE_DECRYPTION, BLOCK_COUNT_ENDPOINT,
-    GET_DECRYPTED_PREIMAGE_STATUS, LIST_GATEWAYS_ENDPOINT, OFFER_ENDPOINT,
-    REGISTER_GATEWAY_ENDPOINT,
+    GET_DECRYPTED_PREIMAGE_STATUS, GET_DECRYPTED_PREIMAGE_STATUS_V2, LIST_GATEWAYS_ENDPOINT,
+    OFFER_ENDPOINT, REGISTER_GATEWAY_ENDPOINT,
 };
 use fedimint_core::module::ApiRequestErased;
 use fedimint_core::query::UnionResponses;
@@ -19,7 +19,9 @@ use itertools::Itertools;
 
 use crate::contracts::incoming::{IncomingContractAccount, IncomingContractOffer};
 use crate::contracts::outgoing::OutgoingContractAccount;
-use crate::contracts::{ContractId, DecryptedPreimageStatus, FundedContract, Preimage};
+use crate::contracts::{
+    ContractId, DecryptedPreimageStatus, DecryptedPreimageStatusV2, FundedContract, Preimage,
+};
 use crate::{ContractAccount, LightningGateway, LightningGatewayAnnouncement};
 
 #[apply(async_trait_maybe_send!)]
@@ -36,6 +38,10 @@ pub trait LnFederationApi {
         &self,
         contract: ContractId,
     ) -> FederationResult<(IncomingContractAccount, DecryptedPreimageStatus)>;
+    async fn get_decrypted_preimage_status_v2(
+        &self,
+        contract: ContractId,
+    ) -> FederationResult<(Option<IncomingContractAccount>, DecryptedPreimageStatusV2)>;
     async fn wait_preimage_decrypted(
         &self,
         contract: ContractId,
@@ -116,6 +122,17 @@ where
     ) -> FederationResult<(IncomingContractAccount, DecryptedPreimageStatus)> {
         self.request_current_consensus(
             GET_DECRYPTED_PREIMAGE_STATUS.to_string(),
+            ApiRequestErased::new(contract),
+        )
+        .await
+    }
+
+    async fn get_decrypted_preimage_status_v2(
+        &self,
+        contract: ContractId,
+    ) -> FederationResult<(Option<IncomingContractAccount>, DecryptedPreimageStatusV2)> {
+        self.request_current_consensus(
+            GET_DECRYPTED_PREIMAGE_STATUS_V2.to_string(),
             ApiRequestErased::new(contract),
         )
         .await

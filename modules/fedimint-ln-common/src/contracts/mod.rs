@@ -147,6 +147,30 @@ pub enum DecryptedPreimageStatus {
     Invalid,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
+pub enum DecryptedPreimageStatusV2 {
+    /// The contract is not yet funded
+    ContractNotFunded,
+    /// There contract is funded but there aren't enough decryption shares yet
+    DecryptionPending,
+    /// The decrypted preimage was valid
+    Decrypted(Preimage),
+    /// The decrypted preimage was invalid
+    Invalid,
+}
+
+impl From<DecryptedPreimageStatus> for DecryptedPreimageStatusV2 {
+    fn from(status: DecryptedPreimageStatus) -> Self {
+        match status {
+            DecryptedPreimageStatus::Pending => DecryptedPreimageStatusV2::DecryptionPending,
+            DecryptedPreimageStatus::Some(preimage) => {
+                DecryptedPreimageStatusV2::Decrypted(preimage)
+            }
+            DecryptedPreimageStatus::Invalid => DecryptedPreimageStatusV2::Invalid,
+        }
+    }
+}
+
 /// Possible outcomes of preimage decryption
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
 pub enum DecryptedPreimage {
