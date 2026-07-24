@@ -1010,6 +1010,8 @@ impl ClientBuilder {
             .collect::<BTreeMap<_, _>>();
         let (client_recovery_progress_sender, client_recovery_progress_receiver) =
             watch::channel(recovery_receiver_init_val);
+        let (client_recovery_failure_sender, client_recovery_failure_receiver) =
+            watch::channel(BTreeMap::new());
 
         let client_inner = Arc::new(Client {
             final_client: final_client.clone(),
@@ -1035,6 +1037,7 @@ impl ClientBuilder {
             client_span,
             operation_log: OperationLog::new(db.clone()),
             client_recovery_progress_receiver,
+            client_recovery_failure_receiver,
             meta_service: self.meta_service,
             iroh_enable_dht: self.iroh_enable_dht,
             user_bitcoind_rpc,
@@ -1143,6 +1146,7 @@ impl ClientBuilder {
                 .collect();
             client_arc.spawn_module_recoveries_task(
                 client_recovery_progress_sender,
+                client_recovery_failure_sender,
                 module_recoveries,
                 module_recovery_progress_receivers,
                 module_kinds,
