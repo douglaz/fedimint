@@ -522,6 +522,17 @@ You can customize the fees the gateway charges per-federation for routing Lightn
 | **Transaction Base Fee** | Fixed fee (in millisatoshis) charged for swaps between federations |
 | **Transaction PPM** | Variable fee to cover charged for swaps between federations |
 
+#### Fee Limits
+
+For connected federations that support LNv2, gateways reject fee updates above the protocol caps, and LNv2 clients independently reject advertised fees above those caps. Each part of a fee is capped on its own, so saving fees fails if either the base fee or the PPM is above its limit, no matter how low the other one is.
+
+| Limit | Applies to | Base | PPM |
+|-------|------------|------|-----|
+| **Send** | Lightning Fee plus Transaction Fee | 100,000 msats | 15,000 |
+| **Receive** | Transaction Fee | 50,000 msats | 5,000 |
+
+Clients refuse to pay a gateway that charges above the send limit, so a gateway configured beyond it before these limits were enforced componentwise will not be routing LNv2 payments until its fees are lowered.
+
 #### How to Set Fees
 
 Fees are configured per-federation:

@@ -184,19 +184,7 @@ impl RoutingInfo {
     }
 }
 
-#[derive(
-    Debug,
-    Clone,
-    Eq,
-    PartialEq,
-    PartialOrd,
-    Hash,
-    Serialize,
-    Deserialize,
-    Encodable,
-    Decodable,
-    Copy,
-)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable, Copy)]
 pub struct PaymentFee {
     pub base: Amount,
     pub parts_per_million: u64,
@@ -225,6 +213,18 @@ impl PaymentFee {
         parts_per_million: 5_000,
     };
 
+    /// Returns whether this fee is no greater than `limit` for EVERY payment
+    /// amount.
+    ///
+    /// Both components must be bounded, because which of two fees costs more
+    /// depends on the amount being paid: a large base with no proportional
+    /// part is cheaper than a purely proportional rate on a big payment and
+    /// dearer on a small one. Comparing the structs themselves cannot express
+    /// that, so limits are checked componentwise instead.
+    pub fn is_within(&self, limit: &PaymentFee) -> bool {
+        self.base <= limit.base && self.parts_per_million <= limit.parts_per_million
+    }
+
     pub fn add_to(&self, msats: u64) -> Amount {
         Amount::from_msats(msats.saturating_add(self.absolute_fee(msats)))
     }
@@ -241,17 +241,19 @@ impl PaymentFee {
         msats
             .saturating_mul(self.parts_per_million)
             .saturating_div(1_000_000)
-            .checked_add(self.base.msats)
-            .expect("The division creates sufficient headroom to add the base fee")
+            .saturating_add(self.base.msats)
     }
 }
 
 impl Add for PaymentFee {
     type Output = PaymentFee;
     fn add(self, rhs: Self) -> Self::Output {
+        // Saturate rather than wrap, since a sum is checked against a limit before
+        // it is charged: an overflowing component must not come out the other side
+        // as a small one that is within the limit.
         PaymentFee {
-            base: self.base + rhs.base,
-            parts_per_million: self.parts_per_million + rhs.parts_per_million,
+            base: Amount::from_msats(self.base.msats.saturating_add(rhs.base.msats)),
+            parts_per_million: self.parts_per_million.saturating_add(rhs.parts_per_million),
         }
     }
 }
@@ -305,5 +307,115 @@ impl FromStr for PaymentFee {
             base,
             parts_per_million,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fedimint_core::Amount;
+
+    use super::PaymentFee;
+
+    /// A purely proportional rate of one hundred percent. Ordering `PaymentFee`
+    /// as a struct compares `base` first, so this rate used to pass a limit
+    /// check against `SEND_FEE_LIMIT` while charging the entire payment.
+    const CONFISCATORY_RATE: PaymentFee = PaymentFee {
+        base: Amount::ZERO,
+        parts_per_million: 1_000_000,
+    };
+
+    #[test]
+    fn confiscatory_rate_is_not_within_send_fee_limit() {
+        assert!(!CONFISCATORY_RATE.is_within(&PaymentFee::SEND_FEE_LIMIT));
+
+        // The cost that motivates the check: on a ten thousand satoshi payment the
+        // rate charges the whole payment where the limit intends 250 satoshis.
+        assert_eq!(CONFISCATORY_RATE.fee(10_000_000), Amount::from_sats(10_000));
+        assert_eq!(
+            PaymentFee::SEND_FEE_LIMIT.fee(10_000_000),
+            Amount::from_sats(250)
+        );
+    }
+
+    #[test]
+    fn a_fee_exceeding_either_component_is_not_within_the_limit() {
+        let excessive_base = PaymentFee {
+            base: PaymentFee::SEND_FEE_LIMIT.base + Amount::from_msats(1),
+            parts_per_million: PaymentFee::SEND_FEE_LIMIT.parts_per_million,
+        };
+
+        assert!(!excessive_base.is_within(&PaymentFee::SEND_FEE_LIMIT));
+
+        let excessive_rate = PaymentFee {
+            base: PaymentFee::SEND_FEE_LIMIT.base,
+            parts_per_million: PaymentFee::SEND_FEE_LIMIT.parts_per_million + 1,
+        };
+
+        assert!(!excessive_rate.is_within(&PaymentFee::SEND_FEE_LIMIT));
+    }
+
+    #[test]
+    fn a_summed_fee_is_bounded_by_the_send_limit() {
+        // The gateway checks its lightning fee plus its transaction fee against the
+        // send limit. Twenty thousand parts per million used to pass that check
+        // because the summed base, well below the limit's base, decided it.
+        let lightning_fee = PaymentFee {
+            base: Amount::from_msats(20),
+            parts_per_million: 20_000,
+        };
+
+        let send_fees = lightning_fee + PaymentFee::TRANSACTION_FEE_DEFAULT;
+
+        assert!(send_fees.base < PaymentFee::SEND_FEE_LIMIT.base);
+        assert!(!send_fees.is_within(&PaymentFee::SEND_FEE_LIMIT));
+    }
+
+    #[test]
+    fn summing_fees_saturates_rather_than_wrapping_past_the_limit() {
+        let extortionate = PaymentFee {
+            base: Amount::from_msats(u64::MAX),
+            parts_per_million: u64::MAX,
+        };
+
+        let send_fees = extortionate + PaymentFee::TRANSACTION_FEE_DEFAULT;
+
+        assert_eq!(send_fees.base, Amount::from_msats(u64::MAX));
+        assert_eq!(send_fees.parts_per_million, u64::MAX);
+        assert!(!send_fees.is_within(&PaymentFee::SEND_FEE_LIMIT));
+        assert_eq!(send_fees.fee(u64::MAX), Amount::from_msats(u64::MAX));
+    }
+
+    #[test]
+    fn the_boundary_is_inclusive() {
+        assert!(PaymentFee::SEND_FEE_LIMIT.is_within(&PaymentFee::SEND_FEE_LIMIT));
+        assert!(PaymentFee::RECEIVE_FEE_LIMIT.is_within(&PaymentFee::RECEIVE_FEE_LIMIT));
+    }
+
+    #[test]
+    fn is_within_is_amount_independent() {
+        // These two fees swap places depending on how much is being paid, which is
+        // why no total order on `PaymentFee` can express a limit.
+        let flat = PaymentFee {
+            base: Amount::from_sats(100),
+            parts_per_million: 0,
+        };
+
+        let proportional = PaymentFee {
+            base: Amount::ZERO,
+            parts_per_million: 15_000,
+        };
+
+        assert!(flat.fee(1_000_000) > proportional.fee(1_000_000));
+        assert!(flat.fee(100_000_000) < proportional.fee(100_000_000));
+
+        // `is_within` is a componentwise predicate over the two fees alone, so it
+        // returns one verdict for both — here, within the limit either way.
+        assert!(flat.is_within(&PaymentFee::SEND_FEE_LIMIT));
+        assert!(proportional.is_within(&PaymentFee::SEND_FEE_LIMIT));
+
+        // And the confiscatory rate is rejected even though it costs nothing on a
+        // payment of zero.
+        assert_eq!(CONFISCATORY_RATE.fee(0), Amount::ZERO);
+        assert!(!CONFISCATORY_RATE.is_within(&PaymentFee::SEND_FEE_LIMIT));
     }
 }

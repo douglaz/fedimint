@@ -185,7 +185,7 @@ async fn config_test(gw_type: LightningNodeType) -> anyhow::Result<()> {
 
                 // Change the routing fees for a specific federation
                 let fed_id = dev_fed.fed().await?.calculate_federation_id();
-                gw.client().set_federation_routing_fee(fed_id.clone(), 20, 20000)
+                gw.client().set_federation_routing_fee(fed_id.clone(), 20, 10000)
                     .await?;
 
                 let lightning_fee = gw.client().get_lightning_fee(fed_id.clone()).await?;
@@ -194,10 +194,28 @@ async fn config_test(gw_type: LightningNodeType) -> anyhow::Result<()> {
                     "Federation base msat is not 20"
                 );
                 assert_eq!(
-                    lightning_fee.parts_per_million, 20000,
-                    "Federation proportional millionths is not 20000"
+                    lightning_fee.parts_per_million, 10000,
+                    "Federation proportional millionths is not 10000"
                 );
                 info!(target: LOG_TEST, "Verified per-federation routing fees changed");
+
+                // A proportional fee above the send limit is rejected on its own, even
+                // though the base fee is far below the limit's base fee. The gateway
+                // only applies the LNv2 send limit to federations carrying the LNv2
+                // module, and older gatewayd binaries compare fees by struct ordering
+                // instead of componentwise, so skip both cases.
+                if devimint::util::supports_lnv2() && !devimint::util::is_backwards_compatibility_test() {
+                    gw.client().set_federation_routing_fee(fed_id.clone(), 20, 20000)
+                        .await
+                        .expect_err("Setting a routing fee above the send limit succeeded");
+
+                    let lightning_fee = gw.client().get_lightning_fee(fed_id.clone()).await?;
+                    assert_eq!(
+                        lightning_fee.parts_per_million, 10000,
+                        "Rejected fee update changed the federation's proportional millionths"
+                    );
+                    info!(target: LOG_TEST, "Verified per-federation routing fees above the send limit are rejected");
+                }
 
                 let info_value = gw.client().get_info().await?;
                 let federations = info_value["federations"]
