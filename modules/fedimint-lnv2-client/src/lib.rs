@@ -368,6 +368,24 @@ impl ClientModule for LightningClientModule {
     }
 }
 
+/// Checks a gateway's quoted `send_fee` against the protocol-wide
+/// [`PaymentFee::SEND_FEE_LIMIT`] and the caller supplied `fee_limit`.
+///
+/// The protocol limit is enforced independently of `fee_limit`, so a caller
+/// passing a limit looser than the protocol's can only ever tighten the
+/// accepted fee, never loosen it.
+fn check_send_fee(send_fee: PaymentFee, fee_limit: PaymentFee) -> Result<(), SendPaymentError> {
+    if !send_fee.is_within(&PaymentFee::SEND_FEE_LIMIT) {
+        return Err(SendPaymentError::GatewayFeeExceedsLimit);
+    }
+
+    if !send_fee.is_within(&fee_limit) {
+        return Err(SendPaymentError::GatewayFeeExceedsCallerFeeLimit);
+    }
+
+    Ok(())
+}
+
 impl LightningClientModule {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -535,12 +553,45 @@ impl LightningClientModule {
     ///
     /// The absolute fee for a payment can be calculated from the operation meta
     /// to be shown to the user in the transaction history.
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// Use [`Self::send_with_fee_limit`] to bound the fee more tightly than the
+    /// protocol limit does.
     pub async fn send(
         &self,
         invoice: Bolt11Invoice,
         gateway: Option<SafeUrl>,
         custom_meta: Value,
+    ) -> Result<OperationId, SendPaymentError> {
+        self.send_with_fee_limit(invoice, gateway, custom_meta, PaymentFee::SEND_FEE_LIMIT)
+            .await
+    }
+
+    /// Pay an invoice, rejecting the selected gateway's fee unless it is within
+    /// `fee_limit` as well as the protocol-wide
+    /// [`PaymentFee::SEND_FEE_LIMIT`].
+    ///
+    /// This is [`Self::send`] with a caller supplied fee policy. Both bounds
+    /// are enforced, so `fee_limit` can only ever tighten the accepted fee,
+    /// never loosen it beyond what the protocol allows. Both are checked
+    /// before the outgoing contract is built and funded, so a rejected fee
+    /// funds nothing.
+    ///
+    /// `fee_limit` bounds the gateway's rate componentwise, as
+    /// [`PaymentFee::is_within`] does: its base fee and its parts per million
+    /// are each bounded by their counterpart in `fee_limit`. It is not an
+    /// absolute cap on what this invoice costs.
+    ///
+    /// `fee_limit` bounds the fee of the gateway that is selected, it does not
+    /// take part in selecting one: automatic selection picks the first
+    /// responsive gateway as [`Self::send`] does, so a payment fails rather
+    /// than falling back to another gateway that would be within the limit.
+    #[allow(clippy::too_many_lines)]
+    pub async fn send_with_fee_limit(
+        &self,
+        invoice: Bolt11Invoice,
+        gateway: Option<SafeUrl>,
+        custom_meta: Value,
+        fee_limit: PaymentFee,
     ) -> Result<OperationId, SendPaymentError> {
         let amount = invoice
             .amount_milli_satoshis()
@@ -588,9 +639,7 @@ impl LightningClientModule {
 
         let (send_fee, expiration_delta) = routing_info.send_parameters(&invoice);
 
-        if !send_fee.is_within(&PaymentFee::SEND_FEE_LIMIT) {
-            return Err(SendPaymentError::GatewayFeeExceedsLimit);
-        }
+        check_send_fee(send_fee, fee_limit)?;
 
         if EXPIRATION_DELTA_LIMIT < expiration_delta {
             return Err(SendPaymentError::GatewayExpirationExceedsLimit);
@@ -1308,6 +1357,8 @@ pub enum SendPaymentError {
     FederationNotSupported,
     #[error("Gateway fee exceeds the allowed limit")]
     GatewayFeeExceedsLimit,
+    #[error("Gateway fee exceeds the fee limit provided by the caller")]
+    GatewayFeeExceedsCallerFeeLimit,
     #[error("Gateway expiration time exceeds the allowed limit")]
     GatewayExpirationExceedsLimit,
     #[error("Failed to request block count")]
@@ -1402,5 +1453,66 @@ impl State for LightningClientStateMachines {
             LightningClientStateMachines::Send(state) => state.operation_id(),
             LightningClientStateMachines::Receive(state) => state.operation_id(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fedimint_core::Amount;
+    use fedimint_lnv2_common::gateway_api::PaymentFee;
+
+    use super::{SendPaymentError, check_send_fee};
+
+    /// A limit tighter than the protocol's on both components.
+    const CALLER_LIMIT: PaymentFee = PaymentFee {
+        base: Amount::from_sats(10),
+        parts_per_million: 1_000,
+    };
+
+    #[test]
+    fn a_fee_within_both_bounds_is_accepted() {
+        let send_fee = PaymentFee {
+            base: Amount::from_sats(5),
+            parts_per_million: 500,
+        };
+
+        assert_eq!(check_send_fee(send_fee, CALLER_LIMIT), Ok(()));
+    }
+
+    #[test]
+    fn a_fee_exceeding_only_the_caller_limit_is_rejected_as_such() {
+        let send_fee = PaymentFee {
+            base: Amount::from_sats(5),
+            parts_per_million: 10_000,
+        };
+
+        assert!(send_fee.is_within(&PaymentFee::SEND_FEE_LIMIT));
+
+        assert_eq!(
+            check_send_fee(send_fee, CALLER_LIMIT),
+            Err(SendPaymentError::GatewayFeeExceedsCallerFeeLimit)
+        );
+    }
+
+    #[test]
+    fn a_looser_caller_limit_cannot_permit_a_fee_the_protocol_rejects() {
+        let send_fee = PaymentFee {
+            base: Amount::from_sats(1_000),
+            parts_per_million: 100_000,
+        };
+
+        // The caller asks for a bound far looser than the protocol's, and the fee is
+        // within it, yet the protocol limit still decides.
+        let loose_limit = PaymentFee {
+            base: Amount::from_sats(10_000),
+            parts_per_million: 1_000_000,
+        };
+
+        assert!(send_fee.is_within(&loose_limit));
+
+        assert_eq!(
+            check_send_fee(send_fee, loose_limit),
+            Err(SendPaymentError::GatewayFeeExceedsLimit)
+        );
     }
 }
