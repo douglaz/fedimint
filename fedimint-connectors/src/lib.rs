@@ -673,6 +673,17 @@ pub enum Connectivity {
 /// active connection; for Iroh this reflects the path at the moment of the
 /// emission and may be stale until the next pool-level change (relay→direct
 /// upgrades on an existing connection are not yet streamed).
+///
+/// At the pool-membership layer, [`PeerStatus::Disconnected`] means the pool
+/// holds no live connection to the peer AND is not in the middle of a refresh.
+/// A pooled connection that its owner deliberately rotated (see
+/// [`ConnectionLiveness::Retired`]) does not surface through that path: the
+/// peer stays advertised across the rotation, and only a re-dial that actually
+/// fails removes it. The pool dials on demand, so that re-dial is the next
+/// request for the peer; a rotation followed by no traffic at all leaves the
+/// peer advertised until then. The API status stream may also report
+/// `Disconnected` when an advertised connection's [`Connectivity`] is
+/// [`Connectivity::Unknown`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PeerStatus {
     Disconnected,
@@ -689,11 +700,66 @@ pub struct IrohPeerInfo {
     pub relay_url: Option<String>,
 }
 
+/// Whether a connection can still serve new requests and, when it cannot,
+/// what that says about the peer behind it.
+///
+/// This is deliberately one three-valued enum rather than a second bool
+/// alongside [`IConnection::is_connected`]: two independent bools admit a
+/// meaningless state and let a caller test them in the wrong order, and the
+/// order matters (see [`ConnectionLiveness::Retired`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConnectionLiveness {
+    /// Usable for new requests.
+    Live,
+
+    /// Not usable for new requests, but the peer is NOT known to be
+    /// unreachable: the connection's owner rotated it on purpose and a
+    /// reconnect is expected to succeed. [`ConnectionPool`] therefore keeps
+    /// the peer advertised across a retirement instead of announcing a
+    /// disconnect it has no evidence for.
+    ///
+    /// Retirement must stay a rare, self-limiting event. A connection that
+    /// reported `Retired` continuously would drive an unthrottled dial loop,
+    /// because the pool grants a refresh its first re-dial for free (see
+    /// [`ConnectionState::new_refreshing`]). The only producer today is the
+    /// iroh request-timeout path, whose tightest budget is
+    /// `IROH_REQUEST_TIMEOUT_DEFAULT` (60s), so a given connection can retire
+    /// at most once per minute — it cannot become a hot path.
+    ///
+    /// "A reconnect is expected" is not a promise that the pool makes one: it
+    /// dials on demand, so the re-dial comes from the next caller that wants
+    /// this peer (`fedimint_client::Client::spawn_federation_reconnect` is the
+    /// opt-in for reconnecting without one).
+    Retired,
+
+    /// Not usable, and the peer should be treated as unreachable until a dial
+    /// proves otherwise.
+    Dead,
+}
+
 /// Generic connection trait shared between [`IGuardianConnection`] and
 /// [`IGatewayConnection`]
 #[apply(async_trait_maybe_send!)]
 pub trait IConnection: Debug + Send + Sync + 'static {
     fn is_connected(&self) -> bool;
+
+    /// Three-valued refinement of [`Self::is_connected`], distinguishing a
+    /// deliberate rotation from a peer that went away.
+    ///
+    /// Provided rather than required: a transport with no retirement concept
+    /// only ever produces [`ConnectionLiveness::Live`] or
+    /// [`ConnectionLiveness::Dead`], which is exactly what the default
+    /// derives from [`Self::is_connected`].
+    ///
+    /// Implementors must keep `liveness() == Live` equivalent to
+    /// `is_connected()`.
+    fn liveness(&self) -> ConnectionLiveness {
+        if self.is_connected() {
+            ConnectionLiveness::Live
+        } else {
+            ConnectionLiveness::Dead
+        }
+    }
 
     async fn await_disconnection(&self);
 }
@@ -776,27 +842,106 @@ impl<T: IConnection + ?Sized> ConnectionPool<T> {
         pool_locked
             .entry(url.to_owned())
             .and_modify(|entry_arc| {
-                // Check if existing connection is disconnected and reset the whole entry.
+                // Check if the existing connection can still serve new requests, and if
+                // not reset the whole entry.
                 //
                 // This resets the state (like connectivity backoff), which is what we want.
                 // Since the (`OnceCell`) was already initialized, it means connection was
-                // successfully before, and disconnected afterwards.
-                if let Some(existing_conn) = entry_arc.connection.get()
-                    && !existing_conn.is_connected()
-                {
-                    trace!(
-                        target: LOG_CLIENT_NET_API,
-                        %url,
-                        "Existing connection is disconnected, removing from pool"
-                    );
-                    self.active_connections.send_modify(|v| {
-                        v.remove(url);
-                    });
-                    *entry_arc = Arc::new(ConnectionState::new_reconnecting());
+                // successfully before, and stopped being usable afterwards.
+                let Some(existing_conn) = entry_arc.connection.get() else {
+                    return;
+                };
+                match existing_conn.liveness() {
+                    ConnectionLiveness::Live => {}
+                    ConnectionLiveness::Retired => {
+                        // A retirement is a rotation the connection's owner chose, not
+                        // evidence that the peer went away, so `active_connections` is
+                        // deliberately left alone: an idle subscription whose long-poll
+                        // budget expires on a schedule must not report its guardian
+                        // `Disconnected` every cycle. If the re-dial then genuinely
+                        // fails, `settle_active_flag` un-advertises the peer, so a
+                        // permanently-down peer is still dropped within one failed dial.
+                        trace!(
+                            target: LOG_CLIENT_NET_API,
+                            %url,
+                            "Existing connection was retired, refreshing while the peer stays advertised"
+                        );
+                        *entry_arc = Arc::new(ConnectionState::new_refreshing());
+                    }
+                    ConnectionLiveness::Dead => {
+                        trace!(
+                            target: LOG_CLIENT_NET_API,
+                            %url,
+                            "Existing connection is disconnected, removing from pool"
+                        );
+                        self.active_connections.send_modify(|v| {
+                            v.remove(url);
+                        });
+                        *entry_arc = Arc::new(ConnectionState::new_reconnecting());
+                    }
                 }
             })
             .or_insert_with(|| Arc::new(ConnectionState::new_initial()))
             .clone()
+    }
+
+    /// Publish the outcome of a connection attempt made on `attempted` into
+    /// `active_connections`, but only if `attempted` is still the pool's
+    /// current entry for `url`.
+    ///
+    /// A pool entry is replaced wholesale on every reset (see
+    /// [`Self::get_or_init_pool_entry`]), while tasks already inside
+    /// `OnceCell::get_or_try_init` keep running against the `Arc` they
+    /// captured. Without the identity check a stale generation's late result
+    /// would speak for the current one — in particular a stale *failed* dial
+    /// would un-advertise a URL whose current generation is connected and
+    /// healthy, and nothing would re-advertise it until that connection died.
+    ///
+    /// Today's two call sites cannot actually reach that state, and the reason
+    /// is worth stating so the check is not mistaken for load-bearing: an entry
+    /// is only ever replaced while its `OnceCell` is populated (the reset skips
+    /// an empty cell, `get_or_init_pool_entry` above), whereas a dial runs
+    /// inside `get_or_try_init`, which holds the initialization permit and sets
+    /// the cell only on success — so no swap can happen under a dial in flight.
+    /// The check is insurance that keeps the invariant local to this helper
+    /// rather than spread across its callers.
+    ///
+    /// Lock order is pool mutex → `active_connections` watch, matching
+    /// [`Self::get_or_init_pool_entry`].
+    async fn settle_active_flag(
+        &self,
+        url: &SafeUrl,
+        attempted: &Arc<ConnectionState<T>>,
+        connected: bool,
+    ) {
+        let pool_locked = self.connections.lock().await;
+
+        let Some(current) = pool_locked.get(url) else {
+            return;
+        };
+        if !Arc::ptr_eq(current, attempted) {
+            return;
+        }
+        // Defence in depth for the failure side: if this very generation already
+        // holds a connection, another task won the race on it and our failure
+        // says nothing about the peer's reachability. (Reached from inside
+        // `get_or_try_init` this cannot fire — the cell is only set once the
+        // closure returns `Ok` — but the check costs nothing and keeps the
+        // helper correct for any caller.)
+        if !connected && current.connection.get().is_some() {
+            return;
+        }
+
+        // `send_if_modified`, NOT `send_modify`: removing a URL that was never
+        // advertised (the ordinary first-connect failure) changes nothing, and
+        // must not tick every status consumer.
+        self.active_connections.send_if_modified(|v| {
+            if connected {
+                v.insert(url.clone())
+            } else {
+                v.remove(url)
+            }
+        });
     }
 
     pub async fn get_or_create_connection<F, Fut>(
@@ -854,6 +999,27 @@ impl<T: IConnection + ?Sized> ConnectionPool<T> {
                 )
                 .await;
 
+                // A failed dial un-advertises the peer, and does so BEFORE the result is
+                // broadcast to the followers piggybacking on this attempt. Removing
+                // first leaves no window in which a task woken by this very failure
+                // could read a stale "connected" for the URL. It is not load-bearing
+                // against the "a follower's later success gets overwritten by this
+                // removal" hazard, which cannot occur either way: `get_or_try_init`
+                // holds its initialization permit for the whole closure, so a woken
+                // follower's retry lands strictly after this removal, and an attempt on
+                // a later generation is turned away by `settle_active_flag`'s identity
+                // check rather than by ordering.
+                //
+                // The removal itself is what keeps a refresh honest: `active_connections`
+                // is only inserted into after a successful `create_connection`, so a
+                // refresh that kept the peer advertised (it does) and then failed to
+                // re-dial would leave the `OnceCell` empty, every later
+                // `get_or_init_pool_entry` would skip its `and_modify` body, and a
+                // permanently-down peer would be advertised `Connected` forever.
+                if res.is_err() {
+                    self.settle_active_flag(url, &pool_entry_arc, false).await;
+                }
+
                 // If any other task was also waiting to connect, send them the connection
                 // result.
                 //
@@ -866,22 +1032,30 @@ impl<T: IConnection + ?Sized> ConnectionPool<T> {
 
                 let conn = res?;
 
-                self.active_connections.send_modify(|v| {
-                    v.insert(url.clone());
-                });
+                // Guarded rather than an unconditional insert: an entry that was already
+                // replaced (say by a refresh that raced this dial) no longer speaks for
+                // the pool, and advertising a connection the pool does not hold would
+                // leave an orphan in the active set.
+                self.settle_active_flag(url, &pool_entry_arc, true).await;
 
+                // Reconcile `active_connections` once this connection stops serving new
+                // requests, so a peer that went away is dropped from the advertised set
+                // even if no caller asks for it again.
+                //
+                // Deliberately a one-shot watch and NOT a re-dial loop: reconnecting a
+                // connection nobody asked for is
+                // `fedimint_client::Client::spawn_federation_reconnect`'s opt-in job
+                // (it costs data and battery, and its tasks are cancellable with the
+                // client, unlike this detached one). A retirement therefore reconciles
+                // here — vacating the entry while keeping the peer advertised, see
+                // [`ConnectionLiveness::Retired`] — and the re-dial comes from the next
+                // caller.
                 fedimint_core::runtime::spawn("connection disconnect watch", {
                     let conn = conn.clone();
                     let s = self.clone();
                     let url = url.clone();
                     async move {
-                        // wait for this connection to disconnect
                         conn.await_disconnection().await;
-                        // And afterwards, update `active_connections`.
-                        //
-                        // This will update the `active_connections` just like calling
-                        // `get_or_create_connection` normally do, but we will
-                        // not attempt to do anything with the result (i.e. try to connect).
                         s.get_or_init_pool_entry(&url).await;
                     }
                 });
@@ -976,6 +1150,38 @@ impl<T: ?Sized> ConnectionState<T> {
         }
     }
 
+    /// Create a new connection state for a connection that was *retired* on
+    /// purpose (see [`ConnectionLiveness::Retired`]) rather than one that
+    /// failed.
+    ///
+    /// The first re-dial is immediate. [`Self::new_reconnecting`]'s ≥500ms
+    /// floor exists for "something is probably wrong, don't hammer", and a
+    /// rotation we chose is not that; paying it on every refresh cycle only
+    /// keeps the peer's "still connected" claim dishonest for longer than
+    /// necessary. Every attempt after the first falls back to the same
+    /// post-disconnect backoff, so a peer that genuinely died at a refresh
+    /// boundary is still not hammered.
+    ///
+    /// Deliberately NOT [`Self::new_initial`]: its ~5ms floor would tight-loop
+    /// if retirements ever did start repeating.
+    pub fn new_refreshing() -> Self {
+        Self {
+            connection: OnceCell::new(),
+            inner: std::sync::Mutex::new(ConnectionStateInner {
+                // The rotation was intentional, so the first attempt is free.
+                fresh: true,
+                backoff: custom_backoff(
+                    // Anything past that first attempt looks like a real failure,
+                    // so it pays the post-disconnect floor.
+                    Duration::from_millis(500),
+                    Duration::from_secs(30),
+                    None,
+                ),
+            }),
+            merge_connection_attempts_chan: std::sync::Mutex::new(broadcast::channel(1).1),
+        }
+    }
+
     /// Record the fact that an attempt to connect is being made, and return
     /// time the caller should wait.
     pub fn pre_reconnect_delay(&self) -> Duration {
@@ -989,5 +1195,387 @@ impl<T: ?Sized> ConnectionState<T> {
         } else {
             backoff_locked.backoff.next().expect("Keeps retrying")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// An in-memory stand-in for a pooled connection whose liveness the test
+    /// drives directly, so the pool's bookkeeping can be exercised without
+    /// opening a socket or standing up an iroh connector.
+    #[derive(Debug)]
+    struct FakeConn {
+        liveness: Mutex<ConnectionLiveness>,
+    }
+
+    impl FakeConn {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                liveness: Mutex::new(ConnectionLiveness::Live),
+            })
+        }
+
+        fn set(&self, liveness: ConnectionLiveness) {
+            *self.liveness.lock().expect("locking failed") = liveness;
+        }
+    }
+
+    #[apply(async_trait_maybe_send!)]
+    impl IConnection for FakeConn {
+        fn is_connected(&self) -> bool {
+            self.liveness() == ConnectionLiveness::Live
+        }
+
+        fn liveness(&self) -> ConnectionLiveness {
+            *self.liveness.lock().expect("locking failed")
+        }
+
+        async fn await_disconnection(&self) {
+            // The tests drive reconciliation by calling `get_or_init_pool_entry`
+            // themselves; pending here keeps the pool's watch task from racing
+            // them.
+            std::future::pending().await
+        }
+    }
+
+    type FakeConnectFut = Pin<Box<dyn Future<Output = ServerResult<Arc<FakeConn>>> + Send>>;
+
+    fn connect_ok(
+        conn: Arc<FakeConn>,
+    ) -> impl Fn(SafeUrl, Option<String>, ConnectorRegistry) -> FakeConnectFut
+    + Clone
+    + Send
+    + Sync
+    + 'static {
+        move |_url, _api_secret, _connectors| {
+            let conn = conn.clone();
+            Box::pin(async move { Ok(conn) })
+        }
+    }
+
+    fn connect_err() -> impl Fn(SafeUrl, Option<String>, ConnectorRegistry) -> FakeConnectFut
+    + Clone
+    + Send
+    + Sync
+    + 'static {
+        move |_url, _api_secret, _connectors| {
+            Box::pin(async move { Err(ServerError::Connection(anyhow!("dial failed in test"))) })
+        }
+    }
+
+    /// A connection whose retirement wakes the pool's disconnect watcher, used
+    /// to pin what that watcher does — and does not — do without another API
+    /// request.
+    #[derive(Debug)]
+    struct AutoRefreshConn {
+        retired: watch::Sender<bool>,
+    }
+
+    impl AutoRefreshConn {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                retired: watch::Sender::new(false),
+            })
+        }
+
+        fn retire(&self) {
+            self.retired.send_replace(true);
+        }
+    }
+
+    #[apply(async_trait_maybe_send!)]
+    impl IConnection for AutoRefreshConn {
+        fn is_connected(&self) -> bool {
+            !*self.retired.borrow()
+        }
+
+        fn liveness(&self) -> ConnectionLiveness {
+            if *self.retired.borrow() {
+                ConnectionLiveness::Retired
+            } else {
+                ConnectionLiveness::Live
+            }
+        }
+
+        async fn await_disconnection(&self) {
+            let mut rx = self.retired.subscribe();
+            let _ = rx.wait_for(|retired| *retired).await;
+        }
+    }
+
+    type AutoRefreshConnectFut =
+        Pin<Box<dyn Future<Output = ServerResult<Arc<AutoRefreshConn>>> + Send>>;
+
+    fn connect_counted(
+        conn: Arc<AutoRefreshConn>,
+        attempts: Arc<AtomicUsize>,
+    ) -> impl Fn(SafeUrl, Option<String>, ConnectorRegistry) -> AutoRefreshConnectFut
+    + Clone
+    + Send
+    + Sync
+    + 'static {
+        move |_url, _api_secret, _connectors| {
+            let conn = conn.clone();
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(conn) })
+        }
+    }
+
+    /// A pool over a registry that is never actually used: every test supplies
+    /// its own `create_connection`, and the registry's connectors stay lazily
+    /// uninitialized, so nothing here touches the network.
+    async fn test_pool() -> (ConnectionPool<FakeConn>, SafeUrl) {
+        let connectors = ConnectorRegistry::build_from_testing_defaults()
+            .bind()
+            .await
+            .expect("registry builds");
+        let url = SafeUrl::parse("ws://guardian.invalid:1234").expect("valid url");
+        (ConnectionPool::new(connectors), url)
+    }
+
+    fn is_advertised<T: IConnection + ?Sized>(pool: &ConnectionPool<T>, url: &SafeUrl) -> bool {
+        pool.active_connections.borrow().contains(url)
+    }
+
+    #[tokio::test]
+    async fn refresh_retirement_keeps_the_peer_advertised() {
+        let (pool, url) = test_pool().await;
+        let conn = FakeConn::new();
+        pool.get_or_create_connection(&url, None, connect_ok(conn.clone()))
+            .await
+            .expect("connects");
+        assert!(is_advertised(&pool, &url));
+
+        conn.set(ConnectionLiveness::Retired);
+        let entry = pool.get_or_init_pool_entry(&url).await;
+
+        assert!(
+            is_advertised(&pool, &url),
+            "a rotation the connection chose is not evidence the peer went away"
+        );
+        assert!(
+            entry.connection.get().is_none(),
+            "the retired connection must be vacated so the next request re-dials"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dead_connection_is_dropped_from_the_advertised_set() {
+        let (pool, url) = test_pool().await;
+        let conn = FakeConn::new();
+        pool.get_or_create_connection(&url, None, connect_ok(conn.clone()))
+            .await
+            .expect("connects");
+        assert!(is_advertised(&pool, &url));
+
+        conn.set(ConnectionLiveness::Dead);
+        let entry = pool.get_or_init_pool_entry(&url).await;
+
+        assert!(
+            !is_advertised(&pool, &url),
+            "a peer that actually went away must drop out immediately"
+        );
+        assert!(entry.connection.get().is_none());
+        assert!(
+            entry.pre_reconnect_delay() >= Duration::from_millis(500),
+            "a dead peer resets to reconnecting, which pays the don't-hammer floor"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_status_tick_is_emitted_across_a_healthy_refresh() {
+        let (pool, url) = test_pool().await;
+        let conn = FakeConn::new();
+        pool.get_or_create_connection(&url, None, connect_ok(conn.clone()))
+            .await
+            .expect("connects");
+
+        let rx = pool.get_active_connection_receiver();
+
+        conn.set(ConnectionLiveness::Retired);
+        pool.get_or_init_pool_entry(&url).await;
+        pool.get_or_create_connection(&url, None, connect_ok(FakeConn::new()))
+            .await
+            .expect("reconnects");
+
+        // Deliberately asserting on the TICK COUNT rather than the final state:
+        // tokio `watch` coalesces, so a remove-then-insert leaves the set looking
+        // identical while having woken every status consumer twice.
+        assert!(
+            !rx.has_changed().expect("sender alive"),
+            "a healthy refresh must not tick status consumers"
+        );
+        assert!(is_advertised(&pool, &url));
+    }
+
+    #[tokio::test]
+    async fn a_failed_reconnect_after_a_refresh_marks_the_peer_disconnected() {
+        let (pool, url) = test_pool().await;
+        let conn = FakeConn::new();
+        pool.get_or_create_connection(&url, None, connect_ok(conn.clone()))
+            .await
+            .expect("connects");
+
+        conn.set(ConnectionLiveness::Retired);
+        pool.get_or_init_pool_entry(&url).await;
+        assert!(
+            is_advertised(&pool, &url),
+            "precondition: the peer stays advertised while the refresh re-dials"
+        );
+
+        // `active_connections` is only inserted into after a successful dial, so
+        // without the removal on the failure path a peer that died at a refresh
+        // boundary would be advertised `Connected` forever.
+        pool.get_or_create_connection(&url, None, connect_err())
+            .await
+            .expect_err("the re-dial fails");
+
+        assert!(
+            !is_advertised(&pool, &url),
+            "one failed re-dial must un-advertise the peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_disconnect_watch_reconciles_a_retirement_without_re_dialing() {
+        let connectors = ConnectorRegistry::build_from_testing_defaults()
+            .bind()
+            .await
+            .expect("registry builds");
+        let pool = ConnectionPool::new(connectors);
+        let url = SafeUrl::parse("ws://guardian.invalid:1234").expect("valid url");
+        let conn = AutoRefreshConn::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        pool.get_or_create_connection(&url, None, connect_counted(conn.clone(), attempts.clone()))
+            .await
+            .expect("initial connection succeeds");
+        assert!(is_advertised(&pool, &url));
+
+        // No request follows this retirement. The watcher reconciles the pool
+        // entry so the next caller re-dials instead of getting the retired
+        // connection back...
+        conn.retire();
+        fedimint_core::runtime::timeout(Duration::from_secs(1), async {
+            loop {
+                let vacated = pool
+                    .connections
+                    .lock()
+                    .await
+                    .get(&url)
+                    .is_some_and(|entry| entry.connection.get().is_none());
+                if vacated {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the disconnect watcher reconciles the retirement");
+
+        // ... but it must NOT dial one itself: re-establishing a connection
+        // nobody asked for is `Client::spawn_federation_reconnect`'s opt-in job,
+        // and a watcher that re-dialed would outlive the client that created the
+        // pool, keeping guardian connections alive after logout. The settle
+        // window gives such a re-dial every chance to show up in `attempts`;
+        // dialing on demand, nothing can move it off 1.
+        fedimint_core::runtime::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "the pool must dial on demand only"
+        );
+        assert!(
+            is_advertised(&pool, &url),
+            "a rotation is not evidence the peer went away, even with no re-dial yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_failed_attempt_does_not_evict_a_newer_connection() {
+        let (pool, url) = test_pool().await;
+        let conn = FakeConn::new();
+        pool.get_or_create_connection(&url, None, connect_ok(conn.clone()))
+            .await
+            .expect("connects");
+        let generation_1 = pool
+            .connections
+            .lock()
+            .await
+            .get(&url)
+            .cloned()
+            .expect("entry exists");
+
+        conn.set(ConnectionLiveness::Retired);
+        let generation_2 = pool.get_or_init_pool_entry(&url).await;
+        assert!(!Arc::ptr_eq(&generation_1, &generation_2));
+
+        // A late failure reported against generation 1 while generation 2 has not
+        // connected yet. Only the identity check can turn this away — the
+        // already-connected check cannot, because generation 2's cell is still
+        // empty — and letting it through would resurrect the very flap this
+        // branch exists to kill. Driven through the private helper directly:
+        // `get_or_create_connection` cannot produce this interleaving (see
+        // `settle_active_flag`), so this pins the helper's contract, not a
+        // reachable production race.
+        pool.settle_active_flag(&url, &generation_1, false).await;
+        assert!(
+            is_advertised(&pool, &url),
+            "a stale generation's failure must not un-advertise a peer mid-refresh"
+        );
+
+        pool.get_or_create_connection(&url, None, connect_ok(FakeConn::new()))
+            .await
+            .expect("reconnects on the new generation");
+        assert!(is_advertised(&pool, &url));
+
+        // Same again once generation 2 is genuinely connected: a late failure
+        // from a generation the pool no longer holds says nothing about a peer
+        // it is happily talking to.
+        pool.settle_active_flag(&url, &generation_1, false).await;
+        assert!(
+            is_advertised(&pool, &url),
+            "a stale generation's failure must not evict a live connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_connect_failure_does_not_tick_the_active_set() {
+        let (pool, url) = test_pool().await;
+        let rx = pool.get_active_connection_receiver();
+
+        pool.get_or_create_connection(&url, None, connect_err())
+            .await
+            .expect_err("the dial fails");
+
+        // The URL was never advertised, so removing it changes nothing — and a
+        // no-op must not wake every status consumer.
+        assert!(
+            !rx.has_changed().expect("sender alive"),
+            "a no-op remove must not tick consumers"
+        );
+    }
+
+    #[test]
+    fn new_refreshing_grants_an_immediate_first_redial() {
+        let refreshing = ConnectionState::<FakeConn>::new_refreshing();
+        assert_eq!(
+            refreshing.pre_reconnect_delay(),
+            Duration::ZERO,
+            "a rotation we chose does not deserve the don't-hammer floor"
+        );
+        assert!(
+            refreshing.pre_reconnect_delay() >= Duration::from_millis(500),
+            "but anything past the first attempt looks like a real failure"
+        );
+
+        // Contrast: a connection that failed pays the floor up front.
+        let reconnecting = ConnectionState::<FakeConn>::new_reconnecting();
+        assert!(reconnecting.pre_reconnect_delay() >= Duration::from_millis(500));
     }
 }

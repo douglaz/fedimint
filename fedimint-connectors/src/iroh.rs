@@ -32,11 +32,12 @@ use fedimint_core::net::iroh::{IROH_IDLE_TIMEOUT, IROH_KEEP_ALIVE_INTERVAL};
 const IROH_MAX_RESPONSE_BYTES: usize = ALEPH_BFT_UNIT_BYTE_LIMIT * 3600 * 4 * 2;
 
 /// Wall-clock budget for a single iroh API request to make it through the QUIC
-/// bi-stream (open + write + finish + read response). If exceeded we close the
-/// underlying [`Connection`], which causes [`IConnection::is_connected`] to
-/// return false on the next pool lookup so a fresh connection is established
-/// for the retry. Used for endpoints that respond promptly (`block_count`,
-/// `status`, etc).
+/// bi-stream (open + write + finish + read response). If exceeded we *retire*
+/// the pooled connection: [`IConnection::liveness`] reports
+/// [`ConnectionLiveness::Retired`] on the next pool lookup, so the retry gets a
+/// freshly dialed connection, and the underlying [`Connection`] is closed only
+/// once the last request still in flight on it drains. Used for endpoints that
+/// respond promptly (`block_count`, `status`, etc).
 const IROH_REQUEST_TIMEOUT_DEFAULT: Duration = Duration::from_secs(60);
 
 /// Wall-clock budget for an iroh API request to a server-side long-poll
@@ -61,7 +62,7 @@ const IROH_REQUEST_TIMEOUT_LONG_POLL: Duration = Duration::from_secs(60 * 60);
 /// (its `expiration_or_fee` is fee-encoded near `u64::MAX`).
 ///
 /// Either way the client's budget is effectively the bound on how long a
-/// *stalled* connection is kept before it is closed and the retry loop
+/// *stalled* connection is kept before it is retired and the retry loop
 /// reconnects — a degraded path cannot deliver the expiration response any
 /// more than it can deliver a settlement. A degraded-but-not-dead
 /// QUIC path (keep-alives still pass, so the 60s idle timeout never fires, but
@@ -93,8 +94,10 @@ const IROH_REQUEST_TIMEOUT_LNV2_WAIT: Duration = Duration::from_secs(5 * 60);
 /// server-side comment says it "mirrors the AWAIT_INCOMING_CONTRACT and
 /// AWAIT_PREIMAGE endpoints"), and the gateway deliberately issues it *before*
 /// the funding output is accepted so the two overlap. It is therefore expected
-/// to block past the 60s prompt default, which without this entry closes the
-/// shared pooled connection once a minute for the whole wait.
+/// to block past the 60s prompt default, which without this entry retires the
+/// shared pooled connection once a minute for the whole wait. Retirement does
+/// not abort the requests already in flight on that connection, but it does
+/// force every new request onto a freshly dialed one.
 const IROH_LNV2_WAIT_METHODS: &[&str] = &[
     "await_incoming_contract",
     "await_incoming_contracts",
@@ -102,21 +105,23 @@ const IROH_LNV2_WAIT_METHODS: &[&str] = &[
     "decryption_key_share",
 ];
 
-/// Application-level QUIC error code we use when closing a [`Connection`]
-/// after a request timeout. Recorded by the peer as the close reason; chosen
+/// Application-level QUIC error code we use when closing a [`Connection`] that
+/// a request timeout retired. Recorded by the peer as the close reason; chosen
 /// arbitrarily but stable across stable and `iroh_next` impls so the two
 /// emit identical telemetry. The value 1 distinguishes us from a graceful
 /// close (0).
 const IROH_REQUEST_TIMEOUT_ERROR_CODE: u32 = 1;
 const IROH_REQUEST_TIMEOUT_ERROR_REASON: &[u8] = b"request timeout";
 
-/// Request timeout strategy: long-poll endpoints (`await_*` / `wait_*`)
-/// get the long bound, everything else gets the default. The string match
-/// is a heuristic; it covers all currently-defined fedimint long-poll
-/// endpoints and stays correct if new ones follow the existing naming
-/// convention. False positives (a non-long-poll endpoint that happens to
-/// match the prefix) just give that one method a longer leash; the worse
-/// case is a false negative — a long-poll method that doesn't match
+/// Request timeout strategy, in three tiers: the exactly-named
+/// [`IROH_LNV2_WAIT_METHODS`] get the short lnv2 wait bound, the remaining
+/// long-poll endpoints (`await_*` / `wait_*`) get the 1-hour bound, and
+/// everything else gets the prompt default. Only the middle tier is a string
+/// match; that heuristic covers all currently-defined fedimint long-poll
+/// endpoints not already named above, and stays correct if new ones follow the
+/// existing naming convention. False positives (a non-long-poll endpoint that
+/// happens to match the prefix) just give that one method a longer leash; the
+/// worse case is a false negative — a long-poll method that doesn't match
 /// either prefix would get the 60s default and fail fast on legitimate
 /// waits, but the upstream retry loop would reconnect and try again.
 fn request_timeout_for_method(method: &ApiMethod) -> Duration {
@@ -168,20 +173,18 @@ const IROH_LNV2_WAIT_SPREAD_SLOTS: u64 = IROH_LNV2_WAIT_SPREAD.as_secs() * 1_000
 /// the counter re-synchronize.
 ///
 /// This bounds clustering rather than eliminating it. Distinct offsets give
-/// distinct cycle periods (`300s - offset`), so peers that were re-issued
-/// together immediately fan out; but two periods still share a finite common
-/// multiple, so a pair does re-coincide eventually. With millisecond slots that
-/// is usually far out — random distinct pairs are typically months to years
-/// apart — while a specially aligned low-`lcm` pair (say 300.0s and 280.0s,
-/// meeting every 70min) can meet much sooner. Either way it is a transient
-/// one-cycle coincidence, not the sustained every-cycle lock the order-derived
-/// offset produced.
+/// distinct cycle periods (`300s - offset`), so peers re-issued together fan
+/// out immediately; but two periods share a finite common multiple, so a pair
+/// does re-coincide eventually — typically months to years out for random
+/// pairs, sooner for a low-`lcm` pair (300.0s and 280.0s meet every 70min).
+/// Either way it is a transient one-cycle coincidence, not the sustained
+/// every-cycle lock an order-derived offset produced.
 ///
 /// Slots are millisecond- rather than second-grained only to make exact
-/// collisions negligible: a 4-peer federation collides with p≈1e-4 over 60_000
-/// slots versus p≈0.1 over 60. Two peers that did collide share a period and so
-/// expire together indefinitely — i.e. exactly as they do with no spread at
-/// all, never worse.
+/// collisions negligible (a 4-peer federation collides with p≈1e-4 over 60_000
+/// slots versus p≈0.1 over 60). Two peers that do collide share a period and
+/// expire together indefinitely — i.e. exactly as with no spread at all, never
+/// worse.
 fn spread_offset_for_peer(node_id: &[u8; 32]) -> Duration {
     // Fold the whole id through the splitmix64 finalizer rather than taking
     // leading bytes directly. A public key should already be uniform, but that
@@ -206,11 +209,17 @@ fn spread_offset_for_peer(node_id: &[u8; 32]) -> Duration {
 ///
 /// A client waiting on several peers issues one wait per peer at the same
 /// moment, so without this their budgets expire together and every pooled
-/// per-peer connection closes on the same tick. Those connections are shared
-/// with unrelated one-shot calls, and not every caller retries (lnv2
-/// `gateways()` uses `request_with_strategy`, not the retrying variant), so a
-/// synchronized close can surface a transient failure on a perfectly healthy
-/// network. Staggering the budgets keeps the closes from clustering.
+/// per-peer connection rotates on the same tick.
+///
+/// That is no longer a *correctness* problem: retirement leaves the requests
+/// already in flight alone, so a synchronized expiry can no longer abort a
+/// non-retrying caller that merely overlapped it. What remains is the cost of
+/// doing every peer's reconnect at once — a dial burst across the whole
+/// federation on each cycle (relay and DNS load, and on mobile one radio
+/// wake-up serving every peer) — and, since a refresh keeps the peer advertised
+/// while it re-dials, every peer sitting in its reconnect window
+/// simultaneously, so one unlucky moment can catch all of them instead of one.
+/// Staggering the budgets keeps the re-dials from clustering.
 ///
 /// Only the short tier is spread: the 1-hour tier expires rarely enough that
 /// clustering is not a concern, and the prompt tier must keep its exact bound.
@@ -235,17 +244,16 @@ fn request_timeout_for_method_spread(method: &ApiMethod, node_id: Option<&[u8; 3
     timeout.saturating_sub(spread_offset_for_peer(node_id))
 }
 
-/// Log a request-timeout-triggered connection close, shared by the stable and
-/// `iroh_next` request paths. A long-poll (budget above the prompt default)
-/// reaching its budget with no data is expected steady state, so it logs at
-/// `debug`; a prompt request exceeding the 60s default is unusual and warns.
+/// Log a request-timeout-triggered connection retirement, shared by the stable
+/// and `iroh_next` request paths.
+///
+/// Three tiers, three levels. The short lnv2 tier expires every cycle on a
+/// perfectly healthy idle subscription, so it is pure noise at anything above
+/// `debug`. The 1-hour tier is different: an hour of a consensus long-poll
+/// producing nothing is the very degraded-path symptom this budget exists to
+/// bound, so it stays visible at default log levels. A prompt request exceeding
+/// the 60s default is genuinely unusual.
 fn log_request_timeout(method_str: &str, timeout: Duration) {
-    // Three tiers, three levels. The short lnv2 tier expires every cycle on a
-    // perfectly healthy idle subscription, so it is pure noise at anything
-    // above `debug`. The 1-hour tier is different: an hour of a consensus
-    // long-poll producing nothing is the very degraded-path symptom this
-    // budget exists to bound, so it stays visible at default log levels. A
-    // prompt request exceeding the 60s default is genuinely unusual.
     if timeout <= IROH_REQUEST_TIMEOUT_DEFAULT {
         warn!(
             target: LOG_NET_IROH,
@@ -284,7 +292,10 @@ use tokio::sync::watch;
 use tracing::{debug, info, trace, warn};
 
 use super::{DynGuaridianConnection, IGuardianConnection, ServerError, ServerResult};
-use crate::{Connectivity, DynGatewayConnection, IConnection, IGatewayConnection, IrohPeerInfo};
+use crate::{
+    ConnectionLiveness, Connectivity, DynGatewayConnection, IConnection, IGatewayConnection,
+    IrohPeerInfo,
+};
 
 #[derive(Clone)]
 pub(crate) struct IrohConnector {
@@ -590,6 +601,7 @@ impl crate::Connector for IrohConnector {
             #[cfg(not(target_family = "wasm"))]
             Self::spawn_connection_monitoring_stable(
                 &self.stable,
+                &conn,
                 node_id,
                 self.path_change.clone(),
             );
@@ -708,22 +720,41 @@ impl IrohConnector {
         }
     }
 
+    /// Watch `conn`'s transport path and bump `path_change` on every change,
+    /// for as long as `conn` is open.
+    ///
+    /// `endpoint.conn_type()` is scoped to the *node*, not the connection, so
+    /// its stream never terminates; a task driving it alone would outlive the
+    /// connection it was spawned for and every reconnect on the override path
+    /// would stack another permanent task. Ending the task with `conn` is what
+    /// bounds that. (`spawn_connection_monitoring_next` needs none of this: it
+    /// watches `paths_stream()`, which is already connection-scoped.)
     #[cfg(not(target_family = "wasm"))]
     fn spawn_connection_monitoring_stable(
         endpoint: &Endpoint,
+        conn: &Connection,
         node_id: NodeId,
         path_change: Arc<watch::Sender<u64>>,
     ) {
         if let Ok(mut conn_type_watcher) = endpoint.conn_type(node_id) {
+            let conn = conn.clone();
             #[allow(clippy::let_underscore_future)]
             let _ = spawn("iroh connection (stable)", async move {
-                if let Ok(conn_type) = conn_type_watcher.get() {
-                    debug!(target: LOG_NET_IROH, %node_id, type = %conn_type, "Connection type (initial)");
-                }
-                while let Ok(event) = conn_type_watcher.updated().await {
-                    debug!(target: LOG_NET_IROH, %node_id, type = %event, "Connection type (changed)");
-                    path_change.send_modify(|c| *c = c.wrapping_add(1));
-                }
+                let watch_paths = std::pin::pin!(async move {
+                    if let Ok(conn_type) = conn_type_watcher.get() {
+                        debug!(target: LOG_NET_IROH, %node_id, type = %conn_type, "Connection type (initial)");
+                    }
+                    while let Ok(event) = conn_type_watcher.updated().await {
+                        debug!(target: LOG_NET_IROH, %node_id, type = %event, "Connection type (changed)");
+                        path_change.send_modify(|c| *c = c.wrapping_add(1));
+                    }
+                });
+                let closed = std::pin::pin!(conn.closed());
+                // Two whole futures raced against each other, rather than a
+                // `select!` inside the watcher loop: this way `closed()` is polled
+                // continuously by one future instead of being re-created (and its
+                // wakeup potentially missed) on every loop iteration.
+                let _ = futures::future::select(watch_paths, closed).await;
             });
         }
     }
@@ -762,9 +793,10 @@ impl IrohConnector {
                     .await;
 
                 #[cfg(not(target_family = "wasm"))]
-                if conn.is_ok() {
+                if let Ok(conn) = &conn {
                     Self::spawn_connection_monitoring_stable(
                         &self.stable,
+                        conn,
                         node_id,
                         self.path_change.clone(),
                     );
@@ -898,9 +930,11 @@ trait IrohGuardianConn: fmt::Debug + Send + Sync + 'static {
 
 /// A pooled guardian connection that can be *retired* without being closed.
 ///
-/// The pool drops an entry once [`IConnection::is_connected`] returns false,
-/// and on a bare iroh connection the only way to make that happen is to close
-/// it — which also aborts every other request in flight on that connection.
+/// The pool vacates an entry once [`IConnection::liveness`] stops reporting
+/// [`ConnectionLiveness::Live`], and a bare iroh connection has no retirement
+/// concept — it only ever answers `Live` or `Dead`, so the sole way to make the
+/// pool let go of one is to close it, which also aborts every other request in
+/// flight on that connection.
 /// Requests sharing a pooled connection are unrelated to one another, and not
 /// all of their callers retry (lnv2 `gateways()` uses `request_with_strategy`,
 /// not the retrying variant), so a routine long-poll refresh could fail a
@@ -909,10 +943,42 @@ trait IrohGuardianConn: fmt::Debug + Send + Sync + 'static {
 /// single-guardian federation has no second peer to absorb anything, so the
 /// call just fails.
 ///
-/// Retiring separates eviction from teardown: the entry stops being handed out
-/// for NEW requests, while requests already in flight run to completion on it.
-/// The connection is closed as soon as the last of them finishes, so it does
-/// not linger and the server-side cancellation still fires promptly.
+/// Retiring separates eviction from teardown: the pool stops handing the entry
+/// out for new requests, while requests already in flight run to completion on
+/// it. The connection is closed once the last of them finishes.
+///
+/// "Stops handing out" is not a revocation of `Arc`s already borrowed. A caller
+/// that took the pool entry just before the retirement finds
+/// [`crate::ConnectionState::connection`] already initialized and runs on this
+/// object anyway ([`crate::ConnectionPool::get_or_create_connection`]); that is
+/// pre-retirement admitted work, and it is served, not aborted.
+///
+/// That drain is not necessarily quick. The pool is keyed by guardian URL
+/// ([`crate::ConnectionPool`]), so every timeout tier multiplexes on the single
+/// QUIC connection to a given guardian: a retirement triggered by the 5-minute
+/// lnv2 tier defers the close until the LONGEST request still riding on that
+/// connection drains — worst case a full [`IROH_REQUEST_TIMEOUT_LONG_POLL`]
+/// hour, behind a parked consensus long-poll. Steady state per guardian is
+/// therefore `1 + (generations still holding a parked 1-hour long-poll)` open
+/// connections, not 1. That population is bounded and drains on its own.
+///
+/// The other half of that price is recovery latency, and it cuts the opposite
+/// way from the connection count: a close used to abort every stream on the
+/// connection, so a request parked on a degraded path was cut short by any
+/// *other* tier's timeout — a 1-hour consensus wait could be freed after 60s by
+/// an unrelated prompt request. Retiring gives that up: each request now waits
+/// out its own budget on a path that has stopped delivering. That is the
+/// deliberate trade — a bounded delay for waits that opted into a long budget,
+/// against aborting healthy unrelated work on every routine rotation — and it
+/// is why the tier shortened here is the one whose stall is actually felt.
+///
+/// Prompt server-side cancellation does NOT follow from the close, and must not
+/// be claimed here yet. A guardian handler parked in
+/// `wait_key_exists`/`wait_key_check` is spawned on the task group and holds
+/// its permit until the key fires, so closing the QUIC connection does not
+/// cancel it (`fedimint-server/src/consensus/iroh_api.rs`). PR #8993 races
+/// those handlers against `Connection::closed()`; only once it lands does the
+/// close free the server-side wait promptly.
 #[derive(Debug)]
 struct PooledGuardianConnection<C> {
     conn: C,
@@ -995,6 +1061,29 @@ impl<C: IrohGuardianConn> IConnection for PooledGuardianConnection<C> {
     fn is_connected(&self) -> bool {
         !*self.retired.borrow() && self.conn.is_open()
     }
+
+    fn liveness(&self) -> ConnectionLiveness {
+        // The retired flag MUST be read BEFORE the socket state, and the order is
+        // load-bearing rather than stylistic. [`IGuardianConnection::request`]
+        // calls `retire()` while still holding its [`InFlightGuard`]; returning
+        // then drops that guard, which observes `in_flight == 1` and a set retired
+        // flag and so calls `close_timed_out()` synchronously, on the requester's
+        // own task, before `request()` even returns. By the time the pool looks, a
+        // retired connection is therefore *already closed* in the common case.
+        // Consulting the socket first would report `Dead` on exactly that dominant
+        // path, the pool would drop the peer from its advertised set, and keeping
+        // the peer advertised across a refresh — the whole point of this method —
+        // would be inert.
+        //
+        // Keeps `liveness() == Live` equivalent to `is_connected()`.
+        if *self.retired.borrow() {
+            ConnectionLiveness::Retired
+        } else if self.conn.is_open() {
+            ConnectionLiveness::Live
+        } else {
+            ConnectionLiveness::Dead
+        }
+    }
 }
 
 #[async_trait]
@@ -1016,11 +1105,6 @@ impl<C: IrohGuardianConn> IGuardianConnection for PooledGuardianConnection<C> {
                     // the pool stops handing it out and the upstream retry loop
                     // gets a fresh connection, WITHOUT tearing down requests that
                     // are still in flight on this one.
-                    //
-                    // A long-poll reaching its budget with no data is EXPECTED
-                    // steady state (idle subscription) — log it at debug. A
-                    // prompt request exceeding the 60s default is genuinely
-                    // unusual — warn.
                     log_request_timeout(&method_str, timeout);
                     self.retire();
                     return Err(ServerError::Transport(anyhow::anyhow!(
@@ -1087,17 +1171,6 @@ impl IrohGuardianConn for Connection {
             .read_to_end(IROH_MAX_RESPONSE_BYTES)
             .await
             .map_err(|e| ServerError::Transport(e.into()))
-    }
-}
-
-#[apply(async_trait_maybe_send!)]
-impl IConnection for iroh_next::endpoint::Connection {
-    async fn await_disconnection(&self) {
-        self.closed().await;
-    }
-
-    fn is_connected(&self) -> bool {
-        self.close_reason().is_none()
     }
 }
 
@@ -1206,8 +1279,8 @@ mod tests {
         IROH_REQUEST_TIMEOUT_LONG_POLL, IrohGuardianConn, request_timeout_for_method,
     };
     use crate::{
-        IConnection, ServerResult, iroh_next_endpoint_url, is_iroh_next_endpoint_url,
-        preserve_iroh_next_marker,
+        ConnectionLiveness, IConnection, ServerResult, iroh_next_endpoint_url,
+        is_iroh_next_endpoint_url, preserve_iroh_next_marker,
     };
 
     const TEST_ENDPOINT_ID: &str =
@@ -1243,10 +1316,11 @@ mod tests {
 
     /// `await_*` endpoints that take the generic 1-hour long-poll budget. If a
     /// new endpoint is added without the prefix it will silently fall through
-    /// to the default 60s budget — this list documents the contract and will
-    /// surface renames as test churn. The lnv2 receive-side waits are
-    /// deliberately absent: they take the shorter tier (see
-    /// [`LNV2_WAIT_ENDPOINTS`]).
+    /// to the default 60s budget. This list documents that contract; it does
+    /// not enforce it, because these are literals rather than the endpoint
+    /// constants themselves, so renaming an endpoint elsewhere leaves the suite
+    /// green. The lnv2 receive-side waits are deliberately absent: they take
+    /// the shorter tier (see [`LNV2_WAIT_ENDPOINTS`]).
     const AWAIT_ENDPOINTS: &[&str] = &[
         // fedimint-core
         "await_output_outcome",
@@ -1336,8 +1410,10 @@ mod tests {
             IROH_LNV2_WAIT_SPREAD, request_timeout_for_method_spread, spread_offset_for_peer,
         };
 
-        // A peer id stands in for a guardian. Vary only the low byte of the
-        // leading 8, so these are as adversarially close as distinct keys get.
+        // A peer id stands in for a guardian; these vary one byte of the
+        // leading word. That the fold consumes the WHOLE id, not just that
+        // word, is pinned separately by
+        // `spread_offset_depends_on_the_whole_node_id`.
         let peer = |n: u8| {
             let mut id = [0u8; 32];
             id[7] = n;
@@ -1405,6 +1481,36 @@ mod tests {
             ),
             IROH_REQUEST_TIMEOUT_DEFAULT
         );
+    }
+
+    #[test]
+    fn spread_offset_depends_on_the_whole_node_id() {
+        use std::collections::BTreeSet;
+
+        use super::spread_offset_for_peer;
+
+        // The fold in `spread_offset_for_peer` runs over all four 8-byte words,
+        // but every other spread assertion here varies only `id[7]` — the low
+        // byte of the FIRST word — so replacing the whole fold with
+        // `mix(u64::from_be_bytes(id[0..8]))` would leave them all green. These
+        // ids differ only in a LATER word, so under that simplification they all
+        // collapse onto one offset.
+        let with_byte = |i: usize, n: u8| {
+            let mut id = [0u8; 32];
+            id[i] = n;
+            id
+        };
+
+        for byte in [31usize, 24] {
+            let offsets: BTreeSet<_> = (0..16u8)
+                .map(|n| spread_offset_for_peer(&with_byte(byte, n)))
+                .collect();
+            assert_eq!(
+                offsets.len(),
+                16,
+                "varying id[{byte}] did not change the spread offset"
+            );
+        }
     }
 
     #[test]
@@ -1555,10 +1661,11 @@ mod tests {
             "a healthy connection must not report a disconnection"
         );
 
-        // Both reconnect loops (fedimint-connectors/src/lib.rs and
-        // fedimint-client/src/client.rs) drive pool refresh off this, so it has
-        // to fire on retire; waiting for the physical close would defer the
-        // refresh until the connection finished draining.
+        // The pool's disconnect watch (fedimint-connectors/src/lib.rs) and the
+        // opt-in reconnect loop (fedimint-client/src/client.rs) both hang off
+        // this, so it has to fire on retire; waiting for the physical close
+        // would defer the pool's reconciliation until the connection finished
+        // draining — up to an hour, behind a parked long-poll.
         pooled.retire();
         assert!(
             pooled.conn.is_open(),
@@ -1568,6 +1675,71 @@ mod tests {
             matches!(disconnected.as_mut().poll(&mut cx), Poll::Ready(())),
             "await_disconnection must wake on retire, not only on close"
         );
+    }
+
+    #[test]
+    fn a_retired_connection_reports_retired_even_after_it_closes() {
+        // The dominant real-world shape: `request()` calls `retire()` inside its
+        // `InFlightGuard` scope and then returns, so the guard drops, sees it is
+        // the last one out of a retired connection, and closes synchronously
+        // before the pool ever looks. A `liveness()` that consulted the socket
+        // before the retired flag would answer `Dead` here, the pool would drop
+        // the peer from its advertised set, and the refresh path would be inert
+        // — while still passing the in-flight case below.
+        let closed_on_retire = pooled();
+        closed_on_retire.retire();
+        assert!(
+            !closed_on_retire.conn.is_open(),
+            "precondition: retiring with nothing in flight closes immediately"
+        );
+        assert_eq!(closed_on_retire.liveness(), ConnectionLiveness::Retired);
+
+        // The other ordering: still draining, so the socket is open.
+        let draining = pooled();
+        let guard = draining.enter();
+        draining.retire();
+        assert!(
+            draining.conn.is_open(),
+            "precondition: retiring with a request in flight does not close"
+        );
+        assert_eq!(draining.liveness(), ConnectionLiveness::Retired);
+
+        // ... and it stays `Retired` across the close that drop triggers.
+        drop(guard);
+        assert!(!draining.conn.is_open());
+        assert_eq!(draining.liveness(), ConnectionLiveness::Retired);
+    }
+
+    #[test]
+    fn a_closed_but_unretired_connection_reports_dead() {
+        // A peer that actually went away must still be dropped from the
+        // advertised set immediately — `Retired` may not swallow this case.
+        let pooled = pooled();
+        pooled.conn.close_timed_out();
+        assert_eq!(pooled.liveness(), ConnectionLiveness::Dead);
+    }
+
+    #[test]
+    fn liveness_agrees_with_is_connected() {
+        // The invariant both methods have to keep: `liveness() == Live` exactly
+        // when `is_connected()`.
+        let healthy = pooled();
+        assert!(healthy.is_connected());
+        assert_eq!(healthy.liveness(), ConnectionLiveness::Live);
+
+        let retired = pooled();
+        let guard = retired.enter();
+        retired.retire();
+        assert!(!retired.is_connected());
+        assert_ne!(retired.liveness(), ConnectionLiveness::Live);
+        drop(guard);
+        assert!(!retired.is_connected());
+        assert_ne!(retired.liveness(), ConnectionLiveness::Live);
+
+        let closed = pooled();
+        closed.conn.close_timed_out();
+        assert!(!closed.is_connected());
+        assert_ne!(closed.liveness(), ConnectionLiveness::Live);
     }
 
     #[test]
