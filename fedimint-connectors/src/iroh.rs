@@ -82,6 +82,25 @@ const IROH_REQUEST_TIMEOUT_LONG_POLL: Duration = Duration::from_secs(60 * 60);
 /// persists `next_index` only after processing a batch, so a retry replays but
 /// never skips), and a replayed incoming contract dedups on its stable
 /// operation id.
+///
+/// # Keep this under the guardian's idle close
+///
+/// `IROH_API_CONNECTION_IDLE_TIMEOUT` in `fedimint-server/src/consensus/
+/// iroh_api.rs` is *also* 5 minutes, chosen independently, and neither
+/// constant references the other. They do not collide today for two separate
+/// reasons, and it is worth writing both down because each could be removed by
+/// a change that looks unrelated:
+///
+/// 1. The guardian only reaps a connection with no request in flight, so a
+///    parked wait holds it open past that timer regardless.
+/// 2. The per-peer spread subtracts up to 60s from this budget, so a request
+///    with a known peer id expires strictly first.
+///
+/// Neither is a guarantee at the boundary: at spread offset 0, and on the
+/// `None`-peer fallback that takes this budget unmodified, the two timers are
+/// exactly equal. If you retune either constant, keep this one strictly below
+/// the guardian's — a client that gives up at the same instant the guardian
+/// reaps cannot tell an idle close apart from a stalled path.
 const IROH_REQUEST_TIMEOUT_LNV2_WAIT: Duration = Duration::from_secs(5 * 60);
 
 /// The retry-safe lnv2 payment-wait endpoints that take the shorter
