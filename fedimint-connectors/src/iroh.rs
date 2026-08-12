@@ -974,8 +974,26 @@ trait IrohGuardianConn: fmt::Debug + Send + Sync + 'static {
 /// "Stops handing out" is not a revocation of `Arc`s already borrowed. A caller
 /// that took the pool entry just before the retirement finds
 /// [`crate::ConnectionState::connection`] already initialized and runs on this
-/// object anyway ([`crate::ConnectionPool::get_or_create_connection`]); that is
-/// pre-retirement admitted work, and it is served, not aborted.
+/// object anyway ([`crate::ConnectionPool::get_or_create_connection`]).
+///
+/// Such a caller is NOT guaranteed to be served, and it is worth being exact
+/// about why, because the guarantee is tempting to assume. Retiring only defers
+/// the close while something is in flight, and the retiring request is usually
+/// the only thing in flight — so its own guard drop closes the connection
+/// synchronously, before `request()` has even returned (which is also why
+/// [`IConnection::liveness`] must read the retired flag before the socket).
+/// A borrower that has not yet called [`Self::enter`] by then simply meets a
+/// closed connection. There is a second, narrower window on the same theme: a
+/// borrower can `enter` between the last guard's `fetch_sub` and its
+/// `close_timed_out`, and get closed underneath.
+///
+/// Both surface as [`ServerError::Transport`] on that one request, which the
+/// api-client retry loop reissues on a freshly dialed connection. What
+/// retirement buys is not that these callers are served — it is that requests
+/// ALREADY in flight are not torn down mid-response, which is the collateral
+/// damage the old unconditional close caused. Closing that remaining window
+/// would take a revocation protocol between admission and teardown; it is not
+/// worth one, but do not write down that it is already closed.
 ///
 /// That drain is not necessarily quick. The pool is keyed by guardian URL
 /// ([`crate::ConnectionPool`]), so every timeout tier multiplexes on the single
