@@ -299,25 +299,31 @@ Use [GitHub search to find more details about every API](https://github.com/sear
 ### Await Incoming Contract Endpoint
 - **Endpoint**: `await_incoming_contract`
 - **Arguments**: `(`[`ContractId`](https://docs.fedimint.org/?search=ContractId)`, u64)` - Contract ID and expiration time
-- **Returns**: `Option<`[`ContractId`](https://docs.fedimint.org/?search=ContractId)`>` - Contract ID if found before expiration
-- **Purpose**: Waits for an incoming Lightning contract to be available or until expiration.
+- **Returns**: `Option<`[`OutPoint`](https://docs.fedimint.org/?search=OutPoint)`>` - Outpoint funding the contract, if found before expiration
+- **Purpose**: Waits for an incoming Lightning contract to be available or until expiration. Long-polls: it blocks until the contract appears or the expiration passes.
+
+### Await Incoming Contracts Endpoint
+- **Endpoint**: `await_incoming_contracts`
+- **Arguments**: `(u64, usize)` - Stream index to resume from, and batch size (must be greater than 0)
+- **Returns**: `(Vec<`[`IncomingContract`](https://docs.fedimint.org/?search=IncomingContract)`>, u64)` - A batch of contracts and the next stream index
+- **Purpose**: Waits for the next batch of incoming contracts from the monotonic contract stream. Long-polls: it blocks until at least one contract is available, so an idle client can wait indefinitely.
 
 ### Await Preimage Endpoint
 - **Endpoint**: `await_preimage`
-- **Arguments**: `(`[`ContractId`](https://docs.fedimint.org/?search=ContractId)`, u64)` - Contract ID and expiration time
+- **Arguments**: `(`[`OutPoint`](https://docs.fedimint.org/?search=OutPoint)`, u64)` - Outpoint and expiration time
 - **Returns**: `Option<[u8; 32]>` - Preimage if found before expiration
-- **Purpose**: Waits for a payment preimage to be revealed or until expiration.
+- **Purpose**: Waits for a payment preimage to be revealed or until expiration. Long-polls: it blocks until the preimage appears or the expiration passes.
 
 ### Decryption Key Share Endpoint
 - **Endpoint**: `decryption_key_share`
-- **Arguments**: [`ContractId`](https://docs.fedimint.org/?search=ContractId) - The contract ID
+- **Arguments**: [`OutPoint`](https://docs.fedimint.org/?search=OutPoint) - The outpoint funding the contract
 - **Returns**: [`DecryptionKeyShare`](https://docs.fedimint.org/?search=DecryptionKeyShare) - The decryption key share
-- **Purpose**: Returns the guardian's decryption key share for a specific contract.
+- **Purpose**: Returns the guardian's decryption key share for a specific contract. Long-polls: the share is written atomically when the funding output is accepted, and the gateway deliberately issues this before acceptance, so the call blocks until the share exists rather than returning a miss.
 
 ### Outgoing Contract Expiration Endpoint
 - **Endpoint**: `outgoing_contract_expiration`
-- **Arguments**: [`ContractId`](https://docs.fedimint.org/?search=ContractId) - The contract ID
-- **Returns**: `Option<u64>` - Blocks until expiration if contract exists
+- **Arguments**: [`OutPoint`](https://docs.fedimint.org/?search=OutPoint) - The outpoint funding the contract
+- **Returns**: `Option<(`[`ContractId`](https://docs.fedimint.org/?search=ContractId)`, u64)>` - Contract ID and blocks until expiration, if the contract exists
 - **Purpose**: Returns the number of blocks until an outgoing contract expires.
 
 ### Add Gateway Endpoint

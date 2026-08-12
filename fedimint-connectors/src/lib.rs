@@ -690,9 +690,16 @@ pub enum Connectivity {
 /// Per-peer connection state reported by the federation API.
 ///
 /// [`PeerStatus::Connected`] carries the current [`Connectivity`] of the
-/// active connection; for Iroh this reflects the path at the moment of the
-/// emission and may be stale until the next pool-level change (relay→direct
-/// upgrades on an existing connection are not yet streamed).
+/// active connection. Consumers are woken both by pool-membership changes and
+/// by [`ConnectorRegistry::connectivity_change_notifier`], which ticks when a
+/// connector observes a path change on an existing connection (relay→direct)
+/// and when a replacement connection is established, so a path change does not
+/// wait on pool membership to surface.
+///
+/// It can still lag in one case worth naming: the iroh path monitors are only
+/// spawned on the connection-override path, so on a plain deployment no
+/// in-connection relay→direct upgrade is observed at all and the reported
+/// [`Connectivity`] is whatever the connector last resolved.
 ///
 /// At the pool-membership layer, [`PeerStatus::Disconnected`] means the pool
 /// holds no live connection to the peer AND is not in the middle of a refresh.
