@@ -1021,12 +1021,30 @@ trait IrohGuardianConn: fmt::Debug + Send + Sync + 'static {
 /// cancel it (`fedimint-server/src/consensus/iroh_api.rs`). PR #8993 races
 /// those handlers against `Connection::closed()`; only once it lands does the
 /// close free the server-side wait promptly.
+/// Why a pooled connection stopped serving new requests.
+///
+/// The distinction is not cosmetic: it decides whether the peer stays
+/// advertised. A rotation is not evidence the peer is unreachable, so the pool
+/// keeps advertising it across one; a fault is exactly that evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetireReason {
+    /// A long-poll budget expired with no data. Expected steady state on an
+    /// idle subscription, and the reason retirement exists: rotate without
+    /// tearing down the requests sharing this connection.
+    Rotation,
+    /// A request that should have been answered promptly was not. The path is
+    /// suspect, so this is NOT a deliberate rotation and must not be reported
+    /// as one - `log_request_timeout` warns about exactly this case.
+    Fault,
+}
+
 #[derive(Debug)]
 struct PooledGuardianConnection<C> {
     conn: C,
-    /// Set once this connection should stop serving new requests. A watch (not
-    /// a plain flag) so [`IConnection::await_disconnection`] can wake on it.
-    retired: watch::Sender<bool>,
+    /// Set once this connection should stop serving new requests, carrying WHY.
+    /// A watch (not a plain flag) so [`IConnection::await_disconnection`] can
+    /// wake on it.
+    retired: watch::Sender<Option<RetireReason>>,
     /// Requests currently in flight on `conn`.
     in_flight: AtomicUsize,
 }
@@ -1050,8 +1068,8 @@ impl<C: IrohGuardianConn> InFlightGuard<'_, C> {
     /// set the flag itself. If another is, that one's `fetch_sub` returned 1
     /// only after this one's, and the flag was set before this one's — so the
     /// release/acquire chain on `in_flight` carries it.
-    fn retire(self) {
-        self.0.retired.send_replace(true);
+    fn retire(self, reason: RetireReason) {
+        self.0.retired.send_replace(Some(reason));
         // `self` drops here: the close, if this was the last request, happens
         // in `Drop` below.
     }
@@ -1061,7 +1079,8 @@ impl<C: IrohGuardianConn> Drop for InFlightGuard<'_, C> {
     fn drop(&mut self) {
         // `fetch_sub` returns the PREVIOUS value, so exactly one dropping guard
         // observes 1 and is therefore the last one out.
-        if self.0.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 && *self.0.retired.borrow() {
+        if self.0.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 && self.0.retired.borrow().is_some()
+        {
             self.0.conn.close_timed_out();
         }
     }
@@ -1071,7 +1090,7 @@ impl<C: IrohGuardianConn> PooledGuardianConnection<C> {
     fn new(conn: C) -> Self {
         Self {
             conn,
-            retired: watch::Sender::new(false),
+            retired: watch::Sender::new(None),
             in_flight: AtomicUsize::new(0),
         }
     }
@@ -1089,7 +1108,12 @@ impl<C: IrohGuardianConn> PooledGuardianConnection<C> {
     /// shape that keeps the close on a single path.
     #[cfg(test)]
     fn retire(&self) {
-        self.enter().retire();
+        self.enter().retire(RetireReason::Rotation);
+    }
+
+    #[cfg(test)]
+    fn retire_faulted(&self) {
+        self.enter().retire(RetireReason::Fault);
     }
 }
 
@@ -1099,13 +1123,13 @@ impl<C: IrohGuardianConn> IConnection for PooledGuardianConnection<C> {
         let closed = std::pin::pin!(self.conn.wait_closed());
         let retired = std::pin::pin!(async {
             let mut rx = self.retired.subscribe();
-            let _ = rx.wait_for(|retired| *retired).await;
+            let _ = rx.wait_for(|retired| retired.is_some()).await;
         });
         futures::future::select(closed, retired).await;
     }
 
     fn is_connected(&self) -> bool {
-        !*self.retired.borrow() && self.conn.is_open()
+        self.retired.borrow().is_none() && self.conn.is_open()
     }
 
     fn liveness(&self) -> ConnectionLiveness {
@@ -1122,12 +1146,15 @@ impl<C: IrohGuardianConn> IConnection for PooledGuardianConnection<C> {
         // would be inert.
         //
         // Keeps `liveness() == Live` equivalent to `is_connected()`.
-        if *self.retired.borrow() {
-            ConnectionLiveness::Retired
-        } else if self.conn.is_open() {
-            ConnectionLiveness::Live
-        } else {
-            ConnectionLiveness::Dead
+        match *self.retired.borrow() {
+            // Only a deliberate rotation earns `Retired`, which is what keeps
+            // the peer advertised. A prompt-tier timeout is evidence the path
+            // is bad, so it reports `Dead` and the pool un-advertises exactly
+            // as it did before retirement existed.
+            Some(RetireReason::Rotation) => ConnectionLiveness::Retired,
+            Some(RetireReason::Fault) => ConnectionLiveness::Dead,
+            None if self.conn.is_open() => ConnectionLiveness::Live,
+            None => ConnectionLiveness::Dead,
         }
     }
 }
@@ -1154,8 +1181,24 @@ impl<C: IrohGuardianConn> IGuardianConnection for PooledGuardianConnection<C> {
                     // the pool stops handing it out and the upstream retry loop
                     // gets a fresh connection, WITHOUT tearing down requests that
                     // are still in flight on this one.
+                    //
+                    // Which tier expired decides whether this is a rotation or a
+                    // fault, and the two must not be conflated. A long-poll
+                    // reaching its budget means only that nothing happened - the
+                    // peer is not implicated, so the pool keeps advertising it
+                    // across the reconnect. A PROMPT request exceeding its budget
+                    // is the opposite: it should have been answered, and the same
+                    // `log_request_timeout` call above warns about it precisely
+                    // because it is unusual. Reporting that peer as connected
+                    // while its path black-holes is a regression on the behaviour
+                    // before retirement existed, where the close un-advertised it.
                     log_request_timeout(&method_str, timeout);
-                    guard.retire();
+                    let reason = if timeout == IROH_REQUEST_TIMEOUT_DEFAULT {
+                        RetireReason::Fault
+                    } else {
+                        RetireReason::Rotation
+                    };
+                    guard.retire(reason);
                     return Err(ServerError::Transport(anyhow::anyhow!(
                         "iroh request {method_str} timed out after {timeout:?}"
                     )));
@@ -1729,11 +1772,32 @@ mod tests {
     /// `start_paused` advances the 60s prompt budget for us — these tests do
     /// not sleep.
     #[tokio::test(start_paused = true)]
-    async fn a_request_that_outlives_its_budget_retires_the_connection() {
+    async fn a_prompt_request_that_outlives_its_budget_reports_the_peer_dead() {
+        // A prompt request should have been answered. Exceeding its budget is
+        // evidence the path is bad, NOT a deliberate rotation - so the peer must
+        // not stay advertised, which is what `Retired` would mean.
         let pooled = pooled();
         let err = pooled
             .request(
                 ApiMethod::Core("block_count".to_owned()),
+                ApiRequestErased::default(),
+            )
+            .await
+            .expect_err("a hung request must not succeed");
+
+        assert!(matches!(err, ServerError::Transport(_)));
+        assert_eq!(pooled.liveness(), ConnectionLiveness::Dead);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_poll_that_outlives_its_budget_only_rotates_the_connection() {
+        // The other side of the same arm: a long-poll reaching its budget means
+        // nothing happened, which implicates the peer not at all. This one must
+        // stay advertised across the reconnect.
+        let pooled = pooled();
+        let err = pooled
+            .request(
+                ApiMethod::Module(0, "await_incoming_contract".to_owned()),
                 ApiRequestErased::default(),
             )
             .await
