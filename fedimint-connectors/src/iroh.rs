@@ -124,7 +124,12 @@ const IROH_REQUEST_TIMEOUT_ERROR_REASON: &[u8] = b"request timeout";
 /// worse case is a false negative — a long-poll method that doesn't match
 /// either prefix would get the 60s default and fail fast on legitimate
 /// waits, but the upstream retry loop would reconnect and try again.
-fn request_timeout_for_method(method: &ApiMethod) -> Duration {
+///
+/// Public so the crates that own the endpoint names can assert their methods
+/// land in the tier they expect. [`IROH_LNV2_WAIT_METHODS`] holds literals, so
+/// nothing here notices an endpoint constant being renamed; the gate has to
+/// live where both the constant and this function are visible.
+pub fn request_timeout_for_method(method: &ApiMethod) -> Duration {
     let name = match method {
         ApiMethod::Core(name) => name.as_str(),
         ApiMethod::Module(_, name) => name.as_str(),
