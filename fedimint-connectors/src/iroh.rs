@@ -32,12 +32,16 @@ use fedimint_core::net::iroh::{IROH_IDLE_TIMEOUT, IROH_KEEP_ALIVE_INTERVAL};
 const IROH_MAX_RESPONSE_BYTES: usize = ALEPH_BFT_UNIT_BYTE_LIMIT * 3600 * 4 * 2;
 
 /// Wall-clock budget for a single iroh API request to make it through the QUIC
-/// bi-stream (open + write + finish + read response). If exceeded we *retire*
-/// the pooled connection: [`IConnection::liveness`] reports
-/// [`ConnectionLiveness::Retired`] on the next pool lookup, so the retry gets a
-/// freshly dialed connection, and the underlying [`Connection`] is closed only
-/// once the last request still in flight on it drains. Used for endpoints that
+/// bi-stream (open + write + finish + read response). Used for endpoints that
 /// respond promptly (`block_count`, `status`, etc).
+///
+/// Exceeding THIS budget is the one timeout that is not a rotation. A prompt
+/// endpoint that does not answer is evidence the path is bad, so it retires as
+/// a [`RetireReason::Fault`]: the connection is closed there and then,
+/// [`IConnection::liveness`] reports [`ConnectionLiveness::Dead`], and the pool
+/// stops advertising the peer. The long-poll tiers, whose budgets expiring
+/// means only that nothing happened, report [`ConnectionLiveness::Retired`] and
+/// keep the peer advertised across the reconnect.
 const IROH_REQUEST_TIMEOUT_DEFAULT: Duration = Duration::from_secs(60);
 
 /// Wall-clock budget for an iroh API request to a server-side long-poll
@@ -113,10 +117,10 @@ const IROH_REQUEST_TIMEOUT_LNV2_WAIT: Duration = Duration::from_secs(5 * 60);
 /// server-side comment says it "mirrors the AWAIT_INCOMING_CONTRACT and
 /// AWAIT_PREIMAGE endpoints"), and the gateway deliberately issues it *before*
 /// the funding output is accepted so the two overlap. It is therefore expected
-/// to block past the 60s prompt default, which without this entry retires the
-/// shared pooled connection once a minute for the whole wait. Retirement does
-/// not abort the requests already in flight on that connection, but it does
-/// force every new request onto a freshly dialed one.
+/// to block past the 60s prompt default. Without this entry it would fall to
+/// that tier, whose expiry is treated as a fault: the shared pooled connection
+/// would be closed and the guardian reported disconnected roughly once a minute
+/// for the whole wait.
 const IROH_LNV2_WAIT_METHODS: &[&str] = &[
     "await_incoming_contract",
     "await_incoming_contracts",
@@ -133,7 +137,7 @@ const IROH_REQUEST_TIMEOUT_ERROR_CODE: u32 = 1;
 const IROH_REQUEST_TIMEOUT_ERROR_REASON: &[u8] = b"request timeout";
 
 /// Request timeout strategy, in three tiers: the exactly-named
-/// [`IROH_LNV2_WAIT_METHODS`] get the short lnv2 wait bound, the remaining
+/// the exactly-named lnv2 payment waits get the short wait bound, the remaining
 /// long-poll endpoints (`await_*` / `wait_*`) get the 1-hour bound, and
 /// everything else gets the prompt default. Only the middle tier is a string
 /// match; that heuristic covers all currently-defined fedimint long-poll
@@ -145,7 +149,7 @@ const IROH_REQUEST_TIMEOUT_ERROR_REASON: &[u8] = b"request timeout";
 /// waits, but the upstream retry loop would reconnect and try again.
 ///
 /// Public so the crates that own the endpoint names can assert their methods
-/// land in the tier they expect. [`IROH_LNV2_WAIT_METHODS`] holds literals, so
+/// land in the tier they expect. That list holds literals, so
 /// nothing here notices an endpoint constant being renamed; the gate has to
 /// live where both the constant and this function are visible.
 pub fn request_timeout_for_method(method: &ApiMethod) -> Duration {
@@ -952,6 +956,23 @@ trait IrohGuardianConn: fmt::Debug + Send + Sync + 'static {
     async fn round_trip(&self, json: &[u8]) -> ServerResult<Vec<u8>>;
 }
 
+/// Why a pooled connection stopped serving new requests.
+///
+/// The distinction is not cosmetic: it decides whether the peer stays
+/// advertised. A rotation is not evidence the peer is unreachable, so the pool
+/// keeps advertising it across one; a fault is exactly that evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetireReason {
+    /// A long-poll budget expired with no data. Expected steady state on an
+    /// idle subscription, and the reason retirement exists: rotate without
+    /// tearing down the requests sharing this connection.
+    Rotation,
+    /// A request that should have been answered promptly was not. The path is
+    /// suspect, so this is NOT a deliberate rotation and must not be reported
+    /// as one - `log_request_timeout` warns about exactly this case.
+    Fault,
+}
+
 /// A pooled guardian connection that can be *retired* without being closed.
 ///
 /// The pool vacates an entry once [`IConnection::liveness`] stops reporting
@@ -1021,23 +1042,6 @@ trait IrohGuardianConn: fmt::Debug + Send + Sync + 'static {
 /// cancel it (`fedimint-server/src/consensus/iroh_api.rs`). PR #8993 races
 /// those handlers against `Connection::closed()`; only once it lands does the
 /// close free the server-side wait promptly.
-/// Why a pooled connection stopped serving new requests.
-///
-/// The distinction is not cosmetic: it decides whether the peer stays
-/// advertised. A rotation is not evidence the peer is unreachable, so the pool
-/// keeps advertising it across one; a fault is exactly that evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetireReason {
-    /// A long-poll budget expired with no data. Expected steady state on an
-    /// idle subscription, and the reason retirement exists: rotate without
-    /// tearing down the requests sharing this connection.
-    Rotation,
-    /// A request that should have been answered promptly was not. The path is
-    /// suspect, so this is NOT a deliberate rotation and must not be reported
-    /// as one - `log_request_timeout` warns about exactly this case.
-    Fault,
-}
-
 #[derive(Debug)]
 struct PooledGuardianConnection<C> {
     conn: C,
@@ -1069,7 +1073,34 @@ impl<C: IrohGuardianConn> InFlightGuard<'_, C> {
     /// only after this one's, and the flag was set before this one's — so the
     /// release/acquire chain on `in_flight` carries it.
     fn retire(self, reason: RetireReason) {
-        self.0.retired.send_replace(Some(reason));
+        // Severity is monotonic: a `Fault` is never downgraded to a `Rotation`.
+        // Two requests on one connection can reach their budgets before the pool
+        // looks - a prompt one faulting and a long-poll rotating - and whichever
+        // wrote last would otherwise decide. Losing the fault that way would
+        // leave a black-holing peer advertised, which is exactly the confusion
+        // these two reasons exist to prevent.
+        self.0
+            .retired
+            .send_if_modified(|current| match (*current, reason) {
+                (Some(RetireReason::Fault), _) => false,
+                (existing, _) if existing == Some(reason) => false,
+                _ => {
+                    *current = Some(reason);
+                    true
+                }
+            });
+
+        // A fault is positive evidence the path is broken, so act on it rather
+        // than only recording it. Draining is right for a rotation - the
+        // requests sharing the connection are fine and tearing them down is the
+        // collateral damage retirement exists to avoid - but on a broken path
+        // they are riding something that will not deliver, and waiting for the
+        // longest of them can mean an hour on the consensus tier. Closing now
+        // errors them promptly and the retry loop reissues on a fresh
+        // connection, which is what this code did before retirement existed.
+        if reason == RetireReason::Fault {
+            self.0.conn.close_timed_out();
+        }
         // `self` drops here: the close, if this was the last request, happens
         // in `Drop` below.
     }
@@ -1109,11 +1140,6 @@ impl<C: IrohGuardianConn> PooledGuardianConnection<C> {
     #[cfg(test)]
     fn retire(&self) {
         self.enter().retire(RetireReason::Rotation);
-    }
-
-    #[cfg(test)]
-    fn retire_faulted(&self) {
-        self.enter().retire(RetireReason::Fault);
     }
 }
 

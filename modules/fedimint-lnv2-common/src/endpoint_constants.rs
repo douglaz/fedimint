@@ -12,11 +12,12 @@ pub const ADD_GATEWAY_ENDPOINT: &str = "add_gateway";
 // What it protects against, if you are tempted to drop it: the three `await_*`
 // names would still match that file's `await_`/`wait_` prefix heuristic and
 // fall back to the 1-hour tier; `decryption_key_share` matches neither and
-// would fall all the way back to the 60s prompt tier, which for a wait the
-// gateway issues before funding acceptance means retiring the shared pooled
-// connection once a minute for the length of the wait. Retirement leaves the
-// requests already in flight on that connection alone, but it does force every
-// new request onto a freshly dialed one.
+// would fall all the way back to the 60s prompt tier. That tier treats a
+// timeout as a FAULT rather than a rotation, so for a wait the gateway issues
+// before funding acceptance the consequence is not merely a re-dial: the
+// connection is closed, the peer is dropped from the advertised set, and the
+// guardian is reported disconnected roughly once a minute for the length of
+// the wait - the exact flapping this branch exists to remove.
 pub const AWAIT_INCOMING_CONTRACT_ENDPOINT: &str = "await_incoming_contract";
 pub const AWAIT_PREIMAGE_ENDPOINT: &str = "await_preimage";
 pub const AWAIT_INCOMING_CONTRACTS_ENDPOINT: &str = "await_incoming_contracts";

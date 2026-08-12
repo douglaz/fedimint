@@ -749,9 +749,11 @@ pub enum ConnectionLiveness {
     /// reported `Retired` continuously would drive an unthrottled dial loop,
     /// because the pool grants a refresh its first re-dial for free (see
     /// [`ConnectionState::new_refreshing`]). The only producer today is the
-    /// iroh request-timeout path, whose tightest budget is
-    /// `IROH_REQUEST_TIMEOUT_DEFAULT` (60s), so a given connection can retire
-    /// at most once per minute — it cannot become a hot path.
+    /// iroh long-poll timeout tiers. Their tightest budget is the lnv2 payment
+    /// wait at 5 minutes, less up to a minute of per-peer spread, so a given
+    /// connection can report this at most about once every four minutes — it
+    /// cannot become a hot path. The 60s prompt tier does NOT produce this: a
+    /// prompt endpoint failing to answer is a fault, and reports `Dead`.
     ///
     /// "A reconnect is expected" is not a promise that the pool makes one: it
     /// dials on demand, so the re-dial comes from the next caller that wants
