@@ -993,6 +993,28 @@ struct PooledGuardianConnection<C> {
 /// request leaves a retired one.
 struct InFlightGuard<'a, C: IrohGuardianConn>(&'a PooledGuardianConnection<C>);
 
+impl<C: IrohGuardianConn> InFlightGuard<'_, C> {
+    /// Stop serving new requests on this connection.
+    ///
+    /// Consuming the guard is what makes this correct rather than merely
+    /// conventional. Retiring is only ever something a request does about its
+    /// own connection, so the retiring caller always holds a guard, so
+    /// `in_flight` is always at least 1 here — and the close therefore has
+    /// exactly one path: some guard's `Drop`. That is the whole invariant, and
+    /// it is now enforced by the signature instead of by every future caller
+    /// remembering to hold a guard across the call.
+    ///
+    /// The last guard out always observes the flag. If this guard is last, it
+    /// set the flag itself. If another is, that one's `fetch_sub` returned 1
+    /// only after this one's, and the flag was set before this one's — so the
+    /// release/acquire chain on `in_flight` carries it.
+    fn retire(self) {
+        self.0.retired.send_replace(true);
+        // `self` drops here: the close, if this was the last request, happens
+        // in `Drop` below.
+    }
+}
+
 impl<C: IrohGuardianConn> Drop for InFlightGuard<'_, C> {
     fn drop(&mut self) {
         // `fetch_sub` returns the PREVIOUS value, so exactly one dropping guard
@@ -1017,33 +1039,15 @@ impl<C: IrohGuardianConn> PooledGuardianConnection<C> {
         InFlightGuard(self)
     }
 
-    /// Stop serving new requests.
+    /// Stop serving new requests, entering and immediately retiring.
     ///
-    /// In practice the caller holds an [`InFlightGuard`], so the close happens
-    /// when that guard (or a later one) drops. The `in_flight == 0` branch is
-    /// defensive: without it a retire with nothing in flight would leave the
-    /// connection open until the pool entry was dropped.
-    ///
-    /// At least one of the two paths always closes, and the reason is subtler
-    /// than it looks. The interleaving to worry about is a last guard reading
-    /// `retired == false` while this reads `in_flight == 1`, so neither closes
-    /// and the connection leaks open. It cannot happen because
-    /// [`watch::Sender`] is `RwLock`-backed: `borrow` takes the read lock and
-    /// `send_replace` the write lock, so the two are ordered against each
-    /// other. If the guard's `borrow` reads `false` it precedes this
-    /// `send_replace`, so its `fetch_sub` also precedes the `load` below, which
-    /// therefore reads 0 and closes here.
-    ///
-    /// That means the flag may NOT be weakened to a plain `AtomicBool` with
-    /// these orderings — without the lock, the store-buffer interleaving is
-    /// real and would need `SeqCst`. Closing twice (guard drops between the
-    /// `send_replace` and the `load`) is possible and harmless; `close` is
-    /// idempotent on both iroh stacks.
+    /// Only for callers that are not already serving a request — which in
+    /// production is none of them, so this is test-only. Retirement from
+    /// inside a request goes through [`InFlightGuard::retire`], which is the
+    /// shape that keeps the close on a single path.
+    #[cfg(test)]
     fn retire(&self) {
-        self.retired.send_replace(true);
-        if self.in_flight.load(Ordering::Acquire) == 0 {
-            self.conn.close_timed_out();
-        }
+        self.enter().retire();
     }
 }
 
@@ -1096,9 +1100,12 @@ impl<C: IrohGuardianConn> IGuardianConnection for PooledGuardianConnection<C> {
             .expect("Serialization to vec can't fail");
 
         let response = {
-            let _guard = self.enter();
+            let guard = self.enter();
             match fedimint_core::runtime::timeout(timeout, self.conn.round_trip(&json)).await {
                 Ok(Ok(bytes)) => bytes,
+                // A transport error is NOT a reason to retire: the connection
+                // reports its own health through `is_open()`, and one failed
+                // request says nothing about the ones sharing it.
                 Ok(Err(err)) => return Err(err),
                 Err(_) => {
                     // The bi-stream stalled past our budget. Retire the entry so
@@ -1106,7 +1113,7 @@ impl<C: IrohGuardianConn> IGuardianConnection for PooledGuardianConnection<C> {
                     // gets a fresh connection, WITHOUT tearing down requests that
                     // are still in flight on this one.
                     log_request_timeout(&method_str, timeout);
-                    self.retire();
+                    guard.retire();
                     return Err(ServerError::Transport(anyhow::anyhow!(
                         "iroh request {method_str} timed out after {timeout:?}"
                     )));
@@ -1271,15 +1278,17 @@ mod tests {
     use fedimint_core::PeerId;
     use fedimint_core::config::FederationId;
     use fedimint_core::invite_code::InviteCode;
-    use fedimint_core::module::ApiMethod;
+    use fedimint_core::module::{ApiError, ApiMethod, ApiRequestErased};
     use fedimint_core::util::SafeUrl;
+    use serde_json::Value;
 
     use super::{
         IROH_REQUEST_TIMEOUT_DEFAULT, IROH_REQUEST_TIMEOUT_LNV2_WAIT,
         IROH_REQUEST_TIMEOUT_LONG_POLL, IrohGuardianConn, request_timeout_for_method,
     };
+    use crate::error::ServerError;
     use crate::{
-        ConnectionLiveness, IConnection, ServerResult, iroh_next_endpoint_url,
+        ConnectionLiveness, IConnection, IGuardianConnection, ServerResult, iroh_next_endpoint_url,
         is_iroh_next_endpoint_url, preserve_iroh_next_marker,
     };
 
@@ -1546,11 +1555,34 @@ mod tests {
         );
     }
 
+    /// What a [`FakeConn`] does when a request reaches the wire.
+    #[derive(Debug, Default, Clone)]
+    enum WireBehavior {
+        /// Never answers, so the caller's budget is what ends the request.
+        #[default]
+        Hang,
+        /// Answers with an encoded `Result<Value, ApiError>`, the shape
+        /// [`IGuardianConnection::request`] deserializes.
+        Answers(Value),
+        /// Fails at the transport, which must NOT retire the connection.
+        Fails,
+    }
+
     /// A stand-in guardian connection that records whether it was closed, so
     /// the retire/drain semantics can be asserted without a live QUIC endpoint.
     #[derive(Debug, Default)]
     struct FakeConn {
         closed: std::sync::atomic::AtomicBool,
+        wire: std::sync::Mutex<WireBehavior>,
+    }
+
+    impl FakeConn {
+        fn with_wire(wire: WireBehavior) -> Self {
+            Self {
+                closed: std::sync::atomic::AtomicBool::new(false),
+                wire: std::sync::Mutex::new(wire),
+            }
+        }
     }
 
     #[async_trait]
@@ -1576,7 +1608,17 @@ mod tests {
         }
 
         async fn round_trip(&self, _json: &[u8]) -> ServerResult<Vec<u8>> {
-            unreachable!("these tests exercise retirement, not the wire")
+            let behavior = self.wire.lock().expect("not poisoned").clone();
+            match behavior {
+                WireBehavior::Hang => std::future::pending().await,
+                WireBehavior::Answers(value) => {
+                    Ok(serde_json::to_vec(&Ok::<Value, ApiError>(value))
+                        .expect("serializing a test response cannot fail"))
+                }
+                WireBehavior::Fails => Err(ServerError::Transport(anyhow::anyhow!(
+                    "fake transport failure"
+                ))),
+            }
         }
     }
 
@@ -1628,12 +1670,72 @@ mod tests {
 
     #[test]
     fn retiring_an_idle_connection_closes_it_immediately() {
-        // Defensive path: nothing in flight, so there is no guard drop coming
-        // that would otherwise close it.
+        // The retiring caller's own guard is the last one out, so the close
+        // lands as it drops rather than waiting on anything else.
         let pooled = pooled();
         pooled.retire();
         assert!(!pooled.is_connected());
         assert!(!pooled.conn.is_open());
+    }
+
+    /// The next three drive [`IGuardianConnection::request`] itself rather than
+    /// `enter()`/`retire()` by hand, because the contract that matters is which
+    /// *outcomes* retire: a budget expiry does, and neither success nor a
+    /// transport error may. Without these, deleting the `retire()` from the
+    /// timeout arm leaves the whole suite green.
+    ///
+    /// `start_paused` advances the 60s prompt budget for us — these tests do
+    /// not sleep.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_that_outlives_its_budget_retires_the_connection() {
+        let pooled = pooled();
+        let err = pooled
+            .request(
+                ApiMethod::Core("block_count".to_owned()),
+                ApiRequestErased::default(),
+            )
+            .await
+            .expect_err("a hung request must not succeed");
+
+        assert!(matches!(err, ServerError::Transport(_)));
+        assert_eq!(pooled.liveness(), ConnectionLiveness::Retired);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_successful_request_leaves_the_connection_alone() {
+        let pooled = super::PooledGuardianConnection::new(FakeConn::with_wire(
+            WireBehavior::Answers(serde_json::json!(1)),
+        ));
+        let value = pooled
+            .request(
+                ApiMethod::Core("block_count".to_owned()),
+                ApiRequestErased::default(),
+            )
+            .await
+            .expect("the fake answers");
+
+        assert_eq!(value, serde_json::json!(1));
+        assert_eq!(pooled.liveness(), ConnectionLiveness::Live);
+        assert!(pooled.conn.is_open());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transport_error_does_not_retire_the_connection() {
+        // A failed request says nothing about the ones sharing this connection.
+        // Retiring here would rotate a connection whose only sin was one bad
+        // request, and nothing else asserts that it does not.
+        let pooled = super::PooledGuardianConnection::new(FakeConn::with_wire(WireBehavior::Fails));
+        let err = pooled
+            .request(
+                ApiMethod::Core("block_count".to_owned()),
+                ApiRequestErased::default(),
+            )
+            .await
+            .expect_err("the fake fails");
+
+        assert!(matches!(err, ServerError::Transport(_)));
+        assert_eq!(pooled.liveness(), ConnectionLiveness::Live);
+        assert!(pooled.conn.is_open());
     }
 
     #[test]

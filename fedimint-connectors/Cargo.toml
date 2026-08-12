@@ -68,5 +68,13 @@ webpki-roots = { workspace = true }
 [target.'cfg(target_family = "wasm")'.dependencies]
 jsonrpsee-wasm-client = { workspace = true }
 
+[dev-dependencies]
+# `test-util` for the paused clock: the request budgets under test are 60s and
+# up, and `fedimint_core::runtime::timeout` resolves to tokio's, so a paused
+# clock auto-advances them instead of the suite sleeping for real. A
+# dev-dependency rather than a feature on the normal one, so `test-util` stays
+# out of every downstream production build graph.
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+
 [lints]
 workspace = true
