@@ -624,6 +624,26 @@ impl ConnectorRegistry {
     pub fn connectivity_change_notifier(&self) -> watch::Receiver<u64> {
         self.inner.path_change.subscribe()
     }
+
+    /// Signal that connectivity should be re-read, without a connector
+    /// having observed a path change on an existing connection.
+    ///
+    /// A newly established connection is such a case, and it is not
+    /// self-announcing: the connectors log the path they start on but only
+    /// tick this notifier on subsequent *changes*. A replacement connection
+    /// can therefore come up on a different path (relay where the old one
+    /// was direct, or the reverse) with nothing telling consumers to look
+    /// again.
+    ///
+    /// This is deliberately not a membership signal. A deliberate refresh
+    /// keeps its peer advertised throughout, so the active set does not
+    /// change and must not be made to tick — that is what would put the
+    /// `Disconnected` flap back.
+    pub(crate) fn note_path_change(&self) {
+        self.inner
+            .path_change
+            .send_modify(|c| *c = c.wrapping_add(1));
+    }
 }
 pub type DynConnector = Arc<dyn Connector>;
 
@@ -1038,6 +1058,19 @@ impl<T: IConnection + ?Sized> ConnectionPool<T> {
                 // leave an orphan in the active set.
                 self.settle_active_flag(url, &pool_entry_arc, true).await;
 
+                // A refresh keeps its peer advertised, so the line above is a no-op
+                // across one and no membership tick is emitted — which is the point,
+                // and what stops the `Disconnected` flap. But status consumers derive
+                // more than membership: they re-read the connector's path
+                // (relay/direct) on every tick, and a replacement connection can come
+                // up on a different path than the one it replaced. The connectors log
+                // their initial path without ticking, so nothing else announces it.
+                //
+                // Signal "re-read connectivity" here instead. It is the right axis
+                // (this is a new path, not a membership change), it cannot resurrect
+                // the flap, and it covers every transport rather than just iroh.
+                self.connectors.note_path_change();
+
                 // Reconcile `active_connections` once this connection stops serving new
                 // requests, so a peer that went away is dropped from the advertised set
                 // even if no caller asks for it again.
@@ -1409,6 +1442,40 @@ mod tests {
         assert!(
             !rx.has_changed().expect("sender alive"),
             "a healthy refresh must not tick status consumers"
+        );
+        assert!(is_advertised(&pool, &url));
+    }
+
+    #[tokio::test]
+    async fn a_refresh_still_tells_consumers_to_re_read_connectivity() {
+        // The other half of the contract above. Suppressing the membership tick
+        // is what stops the flap, but status consumers also re-read the
+        // connector's path on every tick, and a replacement connection can come
+        // up relay where its predecessor was direct. The connectors log their
+        // initial path without ticking, so without this signal a consumer holds
+        // the superseded path indefinitely.
+        let (pool, url) = test_pool().await;
+        let conn = FakeConn::new();
+        pool.get_or_create_connection(&url, None, connect_ok(conn.clone()))
+            .await
+            .expect("connects");
+
+        let membership_rx = pool.get_active_connection_receiver();
+        let path_rx = pool.connectivity_change_notifier();
+
+        conn.set(ConnectionLiveness::Retired);
+        pool.get_or_init_pool_entry(&url).await;
+        pool.get_or_create_connection(&url, None, connect_ok(FakeConn::new()))
+            .await
+            .expect("reconnects");
+
+        assert!(
+            path_rx.has_changed().expect("sender alive"),
+            "a refresh must tell consumers to re-read connectivity"
+        );
+        assert!(
+            !membership_rx.has_changed().expect("sender alive"),
+            "and must still not tick membership"
         );
         assert!(is_advertised(&pool, &url));
     }
